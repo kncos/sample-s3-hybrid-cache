@@ -166,9 +166,9 @@ Tested with 100 concurrent clients (c7gn.large) downloading 100 files (0.1–100
 
 | Scenario | p50 | p95 | p99 | Throughput |
 |----------|-----|-----|-----|------------|
-| Direct to S3 (no proxy) | 634 ms | 1,988 ms | 2,540 ms | 13.3 Gbps |
-| Proxy, cold cache | 627 ms | 4,469 ms | 6,409 ms | 9.8 Gbps |
-| Proxy, warm cache | 578 ms | 839 ms | 1,247 ms | 16.2 Gbps |
+| Direct to S3 (no proxy) | 634 ms | 1,988 ms | 2,540 ms | 1.6 GiB/s |
+| Proxy, cold cache | 627 ms | 4,469 ms | 6,409 ms | 1.1 GiB/s |
+| Proxy, warm cache | 578 ms | 839 ms | 1,247 ms | 1.9 GiB/s |
 
 Warm cache delivers 22% higher throughput and 2.4× lower p95 latency than direct S3 access. Download coordination coalesced 94% of concurrent cache-miss requests during the cold-cache run (4,323 of ~4,600 requests served from cache after waiting, only 272 actual S3 fetches). CloudWatch confirmed 95% S3 data transfer savings: 6.3 GB pulled from S3 to serve 137 GB to 100 clients (22× amplification). Zero errors across 30,000+ requests.
 
@@ -178,11 +178,11 @@ Single m6in.2xlarge test client downloading multiple large files cross-region (e
 
 | Scenario | Throughput |
 |----------|------------|
-| Cache miss (proxy → S3) | ~1.0 GB/s |
-| Cache hit (proxy → FSx) | ~2.4 GB/s |
-| Direct S3 | ~1.3 GB/s |
+| Cache miss (proxy → S3) | ~1.0 GiB/s |
+| Cache hit (proxy → FSx) | ~2.4 GiB/s |
+| Direct S3 | ~1.3 GiB/s |
 
-Cache hits were 2.5× faster than misses and 1.8× faster than direct S3. Cache miss throughput with a single proxy was ~0.5GB/s, even scaled to m6in.8xlarge.
+Cache hits were 2.5× faster than misses and 1.8× faster than direct S3. Cache miss throughput with a single proxy was ~0.5 GiB/s, even scaled to m6in.8xlarge.
 
 ## Status
 
