@@ -20,6 +20,8 @@ Complete configuration guide for S3 Proxy including cache behavior, TTL manageme
 - [Connection Pooling](#connection-pooling)
 - [IP Distribution](#ip-distribution)
 - [Logging Configuration](#logging-configuration)
+  - [Buffered Access Logging](#buffered-access-logging)
+  - [Log Retention and Rotation](#log-retention-and-rotation)
 - [Metrics Configuration](#metrics-configuration)
 - [Dashboard Configuration](#dashboard-configuration)
 - [Health Check Configuration](#health-check-configuration)
@@ -1048,6 +1050,31 @@ logging:
 - Shared NFS storage benefits significantly from buffered writes
 - Local SSD deployments can use smaller intervals (1-2s) for fresher logs
 
+### Log Retention and Rotation
+
+```yaml
+logging:
+  access_log_retention_days: 30              # Default: 30, range: 1-365
+  app_log_retention_days: 30                 # Default: 30, range: 1-365
+  log_cleanup_interval: "24h"                # Default: 24h, range: 1h-7d
+  access_log_file_rotation_interval: "5m"    # Default: 5m, range: 1m-60m
+```
+
+**Retention**: Each proxy instance independently deletes log files older than the configured retention period. No inter-instance coordination is needed on shared storage — each instance manages its own log files.
+
+**Cleanup interval**: How often the background cleanup task scans for and removes expired log files. The default of 24h is sufficient for most deployments; reduce for tighter disk usage control.
+
+**File rotation**: Access log files rotate on this interval — a new file is created every `access_log_file_rotation_interval`, allowing retention cleanup to operate at file granularity. Shorter intervals produce more files but enable finer-grained cleanup; longer intervals reduce file count but may retain more data than the retention period strictly requires.
+
+**Tuning Guide**:
+
+| Setting | Low Value | High Value | Recommendation |
+|---------|-----------|------------|----------------|
+| `access_log_retention_days` | Less disk usage | Longer audit trail | 30 days for most deployments |
+| `app_log_retention_days` | Less disk usage | Longer debug history | 30 days for most deployments |
+| `log_cleanup_interval` | More frequent cleanup, more I/O | Less I/O, slower reclaim | 24h for most workloads |
+| `access_log_file_rotation_interval` | More files, finer cleanup granularity | Fewer files, coarser cleanup | 5m default; increase on high-request-rate deployments |
+
 ## Metrics Configuration
 
 ```yaml
@@ -1336,6 +1363,10 @@ All configuration options can be overridden via environment variables:
 | `APP_LOG_DIR` | `logging.app_log_dir` | `APP_LOG_DIR=/var/log/s3-proxy` |
 | `ACCESS_LOG_FLUSH_INTERVAL` | `logging.access_log_flush_interval` | `ACCESS_LOG_FLUSH_INTERVAL=5s` |
 | `ACCESS_LOG_BUFFER_SIZE` | `logging.access_log_buffer_size` | `ACCESS_LOG_BUFFER_SIZE=1000` |
+| `ACCESS_LOG_RETENTION_DAYS` | `logging.access_log_retention_days` | `ACCESS_LOG_RETENTION_DAYS=30` |
+| `APP_LOG_RETENTION_DAYS` | `logging.app_log_retention_days` | `APP_LOG_RETENTION_DAYS=30` |
+| `LOG_CLEANUP_INTERVAL` | `logging.log_cleanup_interval` | `LOG_CLEANUP_INTERVAL=24h` |
+| `ACCESS_LOG_FILE_ROTATION_INTERVAL` | `logging.access_log_file_rotation_interval` | `ACCESS_LOG_FILE_ROTATION_INTERVAL=5m` |
 | `DASHBOARD_ENABLED` | `dashboard.enabled` | `DASHBOARD_ENABLED=true` |
 | `DASHBOARD_PORT` | `dashboard.port` | `DASHBOARD_PORT=8081` |
 | `DASHBOARD_BIND_ADDRESS` | `dashboard.bind_address` | `DASHBOARD_BIND_ADDRESS=127.0.0.1` |

@@ -9,6 +9,11 @@ Implementation details, architectural decisions, and technical notes for S3 Prox
 3. [Implementation Details](#implementation-details)
 4. [Performance Optimizations](#performance-optimizations)
 5. [Known Limitations](#known-limitations)
+6. [Testing Strategy](#testing-strategy)
+7. [Debugging Tips](#debugging-tips)
+8. [Code Style Guidelines](#code-style-guidelines)
+9. [Contributing Guidelines](#contributing-guidelines)
+10. [References](#references)
 
 ## Architecture Overview
 

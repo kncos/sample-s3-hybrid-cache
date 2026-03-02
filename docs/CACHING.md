@@ -15,8 +15,10 @@
 - [Time-To-Live (TTL) Configuration](#time-to-live-ttl-configuration)
   - [GET TTL](#get-ttl-get_ttl)
   - [HEAD TTL](#head-ttl-head_ttl)
+  - [Minimum TTL Values](#minimum-ttl-values)
   - [PUT TTL](#put-ttl-put_ttl)
   - [Cache Expiration Modes](#cache-expiration-modes-actively_remove_cached_data)
+  - [Presigned URL Support](#presigned-url-support)
 - [Cache Validation Flow](#cache-validation-flow)
 - [S3 Response Header Handling](#s3-response-header-handling)
 - [Conditional Headers Handling](#conditional-headers-handling)
@@ -40,6 +42,7 @@
 - [Part Caching](#part-caching)
 - [Download Coordination](#download-coordination)
 - [Cache Eviction](#cache-eviction)
+- [See Also](#see-also)
 
 ---
 
