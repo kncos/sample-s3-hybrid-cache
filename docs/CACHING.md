@@ -834,6 +834,10 @@ cache:
 
 **Important**: HEAD_TTL and GET_TTL are completely independent. A GET request with valid GET_TTL will serve cached data regardless of HEAD_TTL status.
 
+**Common HEAD-heavy clients:**
+- **AWS Common Runtime (CRT)** — used by AWS CLI v2 and modern SDKs, issues a HeadObject before every GetObject to retrieve object metadata. HEAD caching eliminates the S3 round-trip for these preflight requests.
+- **Mountpoint for Amazon S3** — issues frequent HeadObject requests to check object existence and properties.
+
 ### Minimum TTL Values
 
 There is no enforced minimum for TTL values. Both `head_ttl` and `get_ttl` accept any valid duration, including `"0s"`.
