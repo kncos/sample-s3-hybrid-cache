@@ -1759,6 +1759,14 @@ impl HttpProxy {
                                                 drop(disk_cache_guard);
 
                                                 // Fall through to forward_get_head_with_coordination
+                                            } else if response.status == StatusCode::FORBIDDEN || response.status == StatusCode::UNAUTHORIZED {
+                                                // 403/401 - credentials issue, not a data change
+                                                // Return error to client, do NOT invalidate cache
+                                                debug!(
+                                                    "Full object conditional validation returned {} (auth error), returning to client without cache invalidation: cache_key={}",
+                                                    response.status, cache_key
+                                                );
+                                                return Self::convert_s3_response_to_http(response);
                                             } else {
                                                 // Validation returned unexpected status - forward original request to S3 (Requirement 2.5)
                                                 warn!(
@@ -3165,6 +3173,14 @@ impl HttpProxy {
                                                 proxy_referer,
                                             )
                                             .await;
+                                        } else if response.status == StatusCode::FORBIDDEN || response.status == StatusCode::UNAUTHORIZED {
+                                            // 403/401 - credentials issue, not a data change
+                                            // Return error to client, do NOT invalidate cache
+                                            debug!(
+                                                "Conditional validation returned {} (auth error), returning to client without cache invalidation: cache_key={}",
+                                                response.status, cache_key
+                                            );
+                                            return Self::convert_s3_response_to_http(response);
                                         } else {
                                             // Validation returned unexpected status - forward original request to S3
                                             warn!(

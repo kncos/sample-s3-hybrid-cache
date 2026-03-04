@@ -5,6 +5,11 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.6] - 2026-03-04
+
+### Fixed
+- **Revalidation 403/401 no longer invalidates cache**: When S3 returns 403 Forbidden or 401 Unauthorized during TTL-expiry revalidation, the proxy returns the error to the client without removing cached data. A credentials failure is not a data change — cached data remains valid for other authorized callers.
+
 ## [1.8.5] - 2026-03-04
 
 ### Fixed

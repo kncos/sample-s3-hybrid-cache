@@ -806,6 +806,7 @@ When clients provide conditional headers (If-None-Match, If-Modified-Since, If-M
   - **S3 returns 200 OK** → Return data to client, invalidate old cache, cache new data
   - **S3 returns 304 Not Modified** → Return 304 to client, refresh cache TTL
   - **S3 returns 412 Precondition Failed** → Return 412 to client, do NOT invalidate cache
+  - **S3 returns 403 Forbidden / 401 Unauthorized** → Return error to client, do NOT invalidate cache (credentials issue, not a data change)
 
 This approach eliminates edge cases and ensures the proxy never provides incorrect responses based on potentially stale cached metadata. The proxy acts as a transparent forwarder for all conditional requests, letting S3 handle the complex HTTP conditional logic.
 
@@ -1082,6 +1083,8 @@ Client GET → Proxy checks cache → GET_TTL expired
 `If-None-Match` (ETag) is the primary revalidation signal. `Last-Modified` has one-second granularity — two writes to the same key within one second produce identical timestamps, which can cause false 304 responses. ETag is a content hash that changes on every write regardless of timing.
 
 Both headers are sent when available. If only one is present (e.g., ETag absent for objects PUT through the proxy before v1.8.3), the proxy sends whichever is available. If neither is present (metadata unreadable), the proxy falls back to an unconditional GET.
+
+If S3 returns 403 or 401 during revalidation (expired credentials, revoked access), the proxy returns the error to the client without invalidating the cache. A credentials failure is not a data change — the cached data remains valid for other authorized callers.
 
 #### Scenario 3d: HEAD Detects Object Change (Range Invalidation)
 
