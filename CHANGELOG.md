@@ -5,6 +5,23 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-03-10
+
+### Changed
+- **RwLock for ConnectionPoolManager**: Replaced `Mutex` with `RwLock` across `S3Client`, `CustomHttpsConnector`, and all downstream consumers. The hot path (`get_distributed_ip`, `get_hostname_for_ip`) now acquires a read lock, eliminating per-request serialization. Write locks are only taken for DNS refresh and IP exclusion.
+- **Idle timeout 30s → 55s**: Default `idle_timeout` increased to 55s to align with S3's ~60s server-side timeout, reducing premature connection eviction from hyper's pool.
+- **TCP keepalive via socket2**: New connections apply `SO_KEEPALIVE` (idle=15s, interval=5s, retries=3) before TLS handshake. Dead connections are detected at the TCP layer before hyper tries to reuse them.
+- **TCP receive buffer tuning**: `SO_RCVBUF` set to 256KB by default on new connections for improved large-object throughput. Configurable via `tcp_recv_buffer_size`.
+- **IP health tracking with automatic exclusion**: New `IpHealthTracker` records consecutive failures per IP. After 3 failures (configurable via `ip_failure_threshold`), the IP is removed from the round-robin distributor. DNS refresh (every 60s) restores excluded IPs automatically.
+- **Eager IpDistributor initialization**: `endpoint_overrides` distributors are now initialized at construction time instead of lazily on first request, enabling `get_distributed_ip(&self)` without `&mut self`.
+
+### Removed
+- **Shadow connection pool**: Removed `ConnectionPool`, `Connection`, `HealthMetrics`, `PerformanceMetrics`, `ConnectionPriority`, `ConnectionSelectionCriteria`, `LoadBalancingStrategy`, `DnsResolutionCache`, `IpAddressInfo`, and all associated methods (`get_connection`, `get_or_create_connection`, `release_connection`, `select_best_ip`, `calculate_ip_score`, `get_expired_connections`, `cleanup_idle_connections`, `close_all_connections`, `monitor_connection_health`, `get_multiple_connections`, `get_health_metrics`). These tracked phantom state disconnected from hyper's actual connection pool.
+
+### Added
+- New config fields: `keepalive_idle_secs`, `keepalive_interval_secs`, `keepalive_retries`, `tcp_recv_buffer_size`, `ip_failure_threshold`
+- Dependency: `socket2 = "0.5"` (TCP socket option configuration)
+
 ## [1.8.6] - 2026-03-04
 
 ### Fixed

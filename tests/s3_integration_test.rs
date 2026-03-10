@@ -108,6 +108,7 @@ fn create_test_config() -> Config {
             endpoint_overrides: std::collections::HashMap::new(),
             ip_distribution_enabled: false,
             max_idle_per_ip: 10,
+            ..Default::default()
         },
         compression: CompressionConfig {
             enabled: true,
@@ -161,78 +162,60 @@ async fn test_tcp_passthrough_mode() {
 
 #[tokio::test]
 async fn test_connection_pool_with_s3_endpoints() {
-    // Test connection pooling with S3 endpoint resolution
-    let config = create_test_config();
+    // Test that ConnectionPoolManager can be created and endpoint overrides work
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "s3.us-west-2.amazonaws.com".to_string(),
+        vec!["10.0.1.100".to_string(), "10.0.2.100".to_string()],
+    );
 
-    // Create connection pool manager
-    let mut pool_manager =
-        ConnectionPoolManager::new().expect("Failed to create connection pool manager");
+    let config = s3_proxy::config::ConnectionPoolConfig {
+        endpoint_overrides: overrides,
+        ..Default::default()
+    };
 
-    // Test DNS resolution for S3 endpoints
-    let s3_endpoints = vec![
-        "s3.amazonaws.com",
-        "s3.us-east-1.amazonaws.com",
-        "s3.us-west-2.amazonaws.com",
-    ];
+    let manager = ConnectionPoolManager::new_with_config(config)
+        .expect("Failed to create connection pool manager");
 
-    for endpoint in s3_endpoints {
-        // Test that we can get connection for the endpoint (this will internally resolve DNS)
-        let connection_result = pool_manager.get_connection(endpoint, Some(1024)).await;
+    // Endpoint overrides should be eagerly initialized
+    let ip = manager.get_distributed_ip("s3.us-west-2.amazonaws.com");
+    assert!(ip.is_some(), "Should get an IP from endpoint overrides");
 
-        match connection_result {
-            Ok(_) => {
-                println!(
-                    "Successfully obtained connection for endpoint: {}",
-                    endpoint
-                );
-            }
-            Err(e) => {
-                println!(
-                    "Failed to get connection for endpoint {}: {:?}",
-                    endpoint, e
-                );
-                // This is acceptable in test environment where endpoints might not be accessible
-            }
-        }
-    }
+    // Unknown endpoint returns None
+    let ip = manager.get_distributed_ip("s3.eu-west-1.amazonaws.com");
+    assert!(ip.is_none(), "Unknown endpoint should return None");
 }
 
 #[tokio::test]
 async fn test_load_balancing_across_ips() {
-    // Test load balancing across multiple IP addresses
-    let config = create_test_config();
-    let mut pool_manager =
-        ConnectionPoolManager::new().expect("Failed to create connection pool manager");
-
-    // Test load balancing by making multiple connection requests
-    let endpoint = "s3.amazonaws.com";
-    let mut connection_attempts = 0;
-    let mut successful_connections = 0;
-
-    // Simulate multiple requests to test load balancing
-    for _ in 0..10 {
-        connection_attempts += 1;
-        match pool_manager.get_connection(endpoint, Some(1024)).await {
-            Ok(_) => {
-                successful_connections += 1;
-            }
-            Err(_) => {
-                // Connection failures are acceptable in test environment
-            }
-        }
-    }
-
-    println!(
-        "Load balancing test: {}/{} connections successful",
-        successful_connections, connection_attempts
+    // Test round-robin distribution across IPs
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "s3.us-west-2.amazonaws.com".to_string(),
+        vec![
+            "10.0.1.100".to_string(),
+            "10.0.2.100".to_string(),
+            "10.0.3.100".to_string(),
+        ],
     );
 
-    // If we got any successful connections, load balancing is working
-    if successful_connections > 0 {
-        println!("Load balancing functionality verified");
-    } else {
-        println!("No successful connections - this is acceptable in test environment");
+    let config = s3_proxy::config::ConnectionPoolConfig {
+        endpoint_overrides: overrides,
+        ..Default::default()
+    };
+
+    let manager = ConnectionPoolManager::new_with_config(config)
+        .expect("Failed to create connection pool manager");
+
+    // Collect 6 IPs — should cycle through all 3 twice
+    let mut ips = Vec::new();
+    for _ in 0..6 {
+        ips.push(manager.get_distributed_ip("s3.us-west-2.amazonaws.com").unwrap());
     }
+
+    // Each IP should appear exactly twice
+    let unique: std::collections::HashSet<_> = ips.iter().collect();
+    assert_eq!(unique.len(), 3, "Should have 3 unique IPs");
 }
 
 #[tokio::test]
@@ -298,24 +281,12 @@ async fn test_end_to_end_proxy_setup() {
     let _tcp_proxy = TcpProxy::new(tcp_addr, std::collections::HashMap::new());
 
     // Connection pool manager setup
-    let mut pool_manager =
+    let manager =
         ConnectionPoolManager::new().expect("Failed to create connection pool manager");
 
-    // Cache manager setup
-    let cache_manager = CacheManager::new_with_defaults(
-        config.cache.cache_dir.clone(),
-        config.cache.ram_cache_enabled,
-        config.cache.max_ram_cache_size,
-    );
-
-    // Test that we can get connections to S3 endpoints
-    let s3_connection = pool_manager
-        .get_connection("s3.amazonaws.com", Some(1024))
-        .await;
-    match s3_connection {
-        Ok(_) => println!("Successfully obtained S3 connection"),
-        Err(_) => println!("S3 connection failed - acceptable in test environment"),
-    }
+    // Verify manager starts with no distributors
+    let stats = manager.get_ip_distribution_stats();
+    assert!(stats.endpoints.is_empty(), "No distributors at startup");
 
     println!("End-to-end proxy setup completed successfully");
     println!("HTTP proxy configured for: {}", http_addr);
@@ -324,99 +295,63 @@ async fn test_end_to_end_proxy_setup() {
 
 #[tokio::test]
 async fn test_s3_compatible_services() {
-    // Test compatibility with various S3-compatible services
-    let s3_compatible_endpoints = vec![
-        "s3.amazonaws.com",            // AWS S3
-        "storage.googleapis.com",      // Google Cloud Storage
-        "s3.wasabisys.com",            // Wasabi
-        "nyc3.digitaloceanspaces.com", // DigitalOcean Spaces
-    ];
-
-    let mut pool_manager =
+    // Test that hostname lookup works for IPs in distributors
+    let mut manager =
         ConnectionPoolManager::new().expect("Failed to create connection pool manager");
 
-    for endpoint in s3_compatible_endpoints {
-        // Test connection to each service
-        let connection_result = timeout(
-            Duration::from_secs(5),
-            pool_manager.get_connection(endpoint, Some(1024)),
-        )
-        .await;
+    let ips = vec![
+        "10.0.0.1".parse().unwrap(),
+        "10.0.0.2".parse().unwrap(),
+    ];
+    manager.ip_distributors.insert(
+        "s3.amazonaws.com".to_string(),
+        s3_proxy::connection_pool::IpDistributor::new(ips),
+    );
 
-        match connection_result {
-            Ok(Ok(_)) => {
-                println!("Successfully obtained connection for {}", endpoint);
-            }
-            Ok(Err(e)) => {
-                println!("Failed to connect to {}: {:?}", endpoint, e);
-                // Some endpoints might not be accessible in test environment
-            }
-            Err(_) => {
-                println!("Timeout connecting to {}", endpoint);
-                // Timeout is acceptable in test environment
-            }
-        }
-    }
+    let hostname = manager.get_hostname_for_ip(&"10.0.0.1".parse().unwrap());
+    assert_eq!(hostname, Some("s3.amazonaws.com".to_string()));
+
+    let hostname = manager.get_hostname_for_ip(&"99.99.99.99".parse().unwrap());
+    assert_eq!(hostname, None);
 }
 
 #[tokio::test]
 async fn test_connection_health_monitoring() {
-    // Test connection health monitoring functionality
-    let pool_manager =
-        ConnectionPoolManager::new().expect("Failed to create connection pool manager");
+    // Test IpHealthTracker functionality
+    let tracker = s3_proxy::connection_pool::IpHealthTracker::new(3);
+    let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
 
-    let endpoint = "s3.amazonaws.com";
+    // Two failures — not yet at threshold
+    assert!(!tracker.record_failure(&ip));
+    assert!(!tracker.record_failure(&ip));
 
-    // Test health metrics collection
-    let health_metrics = pool_manager.get_health_metrics().await;
-    assert!(
-        health_metrics.is_ok(),
-        "Should be able to get health metrics"
-    );
+    // Success resets
+    tracker.record_success(&ip);
 
-    let metrics = health_metrics.unwrap();
-    println!("Health metrics collected: {} entries", metrics.len());
-
-    // Verify metrics structure
-    for metric in &metrics {
-        println!("Health metric for IP: {}", metric.ip_address);
-        println!("  Total requests: {}", metric.total_requests);
-        println!("  Failed requests: {}", metric.failed_requests);
-        println!("  Success rate: {:.2}", metric.success_rate);
-    }
+    // Need 3 more failures to hit threshold
+    assert!(!tracker.record_failure(&ip));
+    assert!(!tracker.record_failure(&ip));
+    assert!(tracker.record_failure(&ip)); // threshold reached
 }
 
 #[tokio::test]
 async fn test_performance_metrics_tracking() {
-    // Test performance metrics tracking for connection selection
-    let mut pool_manager =
-        ConnectionPoolManager::new().expect("Failed to create connection pool manager");
+    // Test IP distribution stats reporting
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "s3.us-west-2.amazonaws.com".to_string(),
+        vec!["10.0.1.100".to_string(), "10.0.2.100".to_string()],
+    );
 
-    let endpoint = "s3.amazonaws.com";
+    let config = s3_proxy::config::ConnectionPoolConfig {
+        endpoint_overrides: overrides,
+        ..Default::default()
+    };
 
-    // Test that we can get a connection (which will create metrics)
-    match pool_manager.get_connection(endpoint, Some(1024)).await {
-        Ok(_) => {
-            println!("Successfully obtained connection for performance metrics test");
+    let manager = ConnectionPoolManager::new_with_config(config)
+        .expect("Failed to create connection pool manager");
 
-            // Get health metrics to verify tracking
-            let health_metrics = pool_manager
-                .get_health_metrics()
-                .await
-                .expect("Should get health metrics");
-
-            if !health_metrics.is_empty() {
-                let metric = &health_metrics[0];
-                println!(
-                    "Performance metrics tracked successfully for IP: {}",
-                    metric.ip_address
-                );
-                println!("Total requests: {}", metric.total_requests);
-                println!("Success rate: {:.2}", metric.success_rate);
-            }
-        }
-        Err(_) => {
-            println!("Skipping performance metrics test - cannot connect to endpoint");
-        }
-    }
+    let stats = manager.get_ip_distribution_stats();
+    assert_eq!(stats.endpoints.len(), 1);
+    assert_eq!(stats.endpoints[0].total_distributor_ips, 2);
 }

@@ -2,19 +2,23 @@
 //!
 //! This module provides a custom connector that integrates Hyper's connection pooling
 //! with the existing ConnectionPoolManager for IP selection and load balancing.
+//! Applies TCP socket options (keepalive, receive buffer) via socket2 before TLS handshake.
 
-use crate::connection_pool::ConnectionPoolManager;
+use crate::config::ConnectionPoolConfig;
+use crate::connection_pool::{ConnectionPoolManager, IpHealthTracker};
 use crate::{ProxyError, Result};
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper::Uri;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use rustls::pki_types::ServerName;
+use socket2::{Socket, TcpKeepalive};
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
@@ -75,32 +79,35 @@ impl Connection for HttpsStream {
     }
 }
 
-/// Custom HTTPS connector that integrates with ConnectionPoolManager
+/// Custom HTTPS connector that integrates with ConnectionPoolManager.
 ///
-/// This connector implements the tower::Service trait required by Hyper's client.
-/// It consults the ConnectionPoolManager for IP selection (load balancing) and
-/// establishes TLS connections using tokio-rustls.
+/// Applies TCP keepalive and receive buffer options via socket2 on new connections.
+/// Records connection failures in IpHealthTracker for automatic IP exclusion.
 pub struct CustomHttpsConnector {
-    pool_manager: Arc<tokio::sync::Mutex<ConnectionPoolManager>>,
+    pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     tls_connector: TlsConnector,
+    config: ConnectionPoolConfig,
+    health_tracker: Arc<IpHealthTracker>,
     metrics_manager:
         Arc<tokio::sync::RwLock<Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>>>,
 }
 
 impl CustomHttpsConnector {
-    /// Create a new CustomHttpsConnector
     pub fn new(
-        pool_manager: Arc<tokio::sync::Mutex<ConnectionPoolManager>>,
+        pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
         tls_connector: TlsConnector,
+        config: ConnectionPoolConfig,
+        health_tracker: Arc<IpHealthTracker>,
     ) -> Self {
         Self {
             pool_manager,
             tls_connector,
+            config,
+            health_tracker,
             metrics_manager: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
-    /// Set the shared metrics manager reference for tracking connection metrics
     pub fn set_metrics_manager_ref(
         &mut self,
         metrics_manager: Arc<
@@ -111,13 +118,48 @@ impl CustomHttpsConnector {
     }
 }
 
+/// Apply TCP socket options (keepalive + receive buffer) via socket2.
+/// Converts TcpStream → socket2::Socket → apply options → convert back.
+/// Errors are logged as warnings and do not fail the connection.
+fn apply_socket_options(tcp: TcpStream, config: &ConnectionPoolConfig) -> std::result::Result<TcpStream, ProxyError> {
+    let std_stream = tcp.into_std().map_err(|e| {
+        ProxyError::ConnectionError(format!("Failed to convert TcpStream to std: {}", e))
+    })?;
+
+    let socket = Socket::from(std_stream);
+
+    // TCP keepalive
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(config.keepalive_idle_secs))
+        .with_interval(Duration::from_secs(config.keepalive_interval_secs))
+        .with_retries(config.keepalive_retries);
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+        warn!("Failed to set TCP keepalive: {}", e);
+    }
+
+    // Receive buffer
+    if let Some(size) = config.tcp_recv_buffer_size {
+        if let Err(e) = socket.set_recv_buffer_size(size) {
+            warn!("Failed to set SO_RCVBUF to {}: {}", size, e);
+        }
+    }
+
+    let std_stream: std::net::TcpStream = socket.into();
+    let tcp = TcpStream::from_std(std_stream).map_err(|e| {
+        ProxyError::ConnectionError(format!("Failed to convert std TcpStream back to tokio: {}", e))
+    })?;
+
+    tcp.set_nodelay(true).ok();
+
+    Ok(tcp)
+}
+
 impl Service<Uri> for CustomHttpsConnector {
     type Response = HttpsStream;
     type Error = ProxyError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        // Always ready to create new connections
         Poll::Ready(Ok(()))
     }
 
@@ -125,22 +167,20 @@ impl Service<Uri> for CustomHttpsConnector {
         let pool_manager = Arc::clone(&self.pool_manager);
         let tls_connector = self.tls_connector.clone();
         let metrics_manager = self.metrics_manager.clone();
+        let config = self.config.clone();
+        let health_tracker = Arc::clone(&self.health_tracker);
 
         Box::pin(async move {
-            // Extract hostname from URI
             let uri_host = uri
                 .host()
                 .ok_or_else(|| ProxyError::ConfigError("No host in URI".to_string()))?;
 
-            // Detect whether the URI host is an IP address (from IpDistributor rewriting)
-            // or a regular hostname. When it's an IP, we need to:
-            // 1. Use the IP directly for TCP connection (skip ConnectionPoolManager IP selection)
-            // 2. Look up the original hostname for TLS SNI (Requirement 2.1)
+            // Determine connect IP and TLS hostname
             let (connect_ip, tls_hostname) = if let Ok(ip) = uri_host.parse::<IpAddr>() {
                 // URI host is an IP — IpDistributor already selected it.
                 // Look up the original S3 hostname for TLS SNI.
                 let hostname = {
-                    let pm = pool_manager.lock().await;
+                    let pm = pool_manager.read().await;
                     pm.get_hostname_for_ip(&ip)
                 };
 
@@ -153,9 +193,6 @@ impl Service<Uri> for CustomHttpsConnector {
                         (ip, h)
                     }
                     None => {
-                        // Fallback: no hostname mapping found. This shouldn't happen in normal
-                        // operation since the IpDistributor populated the mapping. Log a warning
-                        // and attempt to use the IP as-is (TLS will likely fail).
                         warn!(
                             "[HTTPS_CONNECTOR] No hostname mapping found for IP {}, TLS SNI may fail",
                             ip
@@ -164,51 +201,64 @@ impl Service<Uri> for CustomHttpsConnector {
                     }
                 }
             } else {
-                // URI host is a regular hostname — use existing ConnectionPoolManager path
+                // URI host is a regular hostname — connect directly via DNS
                 debug!(
-                    "[HTTPS_CONNECTOR] Establishing connection to hostname: {}",
+                    "[HTTPS_CONNECTOR] Connecting to hostname directly: {}",
                     uri_host
                 );
-
-                let connection = {
-                    let mut pm = pool_manager.lock().await;
-                    pm.get_connection(uri_host, None).await?
-                };
-
-                let ip = connection.ip_address;
-                debug!(
-                    "[HTTPS_CONNECTOR] Selected IP {} for hostname {}",
-                    ip, uri_host
-                );
-                (ip, uri_host.to_string())
+                // Resolve hostname to IP for connect — use first resolved address
+                let addrs: Vec<std::net::SocketAddr> =
+                    tokio::net::lookup_host(format!("{}:443", uri_host))
+                        .await
+                        .map_err(|e| {
+                            ProxyError::ConnectionError(format!(
+                                "DNS resolution failed for {}: {}",
+                                uri_host, e
+                            ))
+                        })?
+                        .collect();
+                let addr = addrs.first().ok_or_else(|| {
+                    ProxyError::ConnectionError(format!(
+                        "No addresses found for {}",
+                        uri_host
+                    ))
+                })?;
+                (addr.ip(), uri_host.to_string())
             };
 
-            // Establish TCP connection to selected IP
+            // Establish TCP connection
             let tcp = TcpStream::connect((connect_ip, 443)).await.map_err(|e| {
                 warn!(
                     "[HTTPS_CONNECTOR] TCP connection failed to {}:{}: {}",
                     connect_ip, 443, e
                 );
+                // Record failure for health tracking
+                if health_tracker.record_failure(&connect_ip) {
+                    warn!(ip = %connect_ip, "IP failure threshold reached on TCP connect, excluding");
+                    let pm = pool_manager.clone();
+                    let host = tls_hostname.clone();
+                    tokio::spawn(async move {
+                        let mut pm = pm.write().await;
+                        if let Some(dist) = pm.get_distributor_mut(&host) {
+                            dist.remove_ip(connect_ip, "TCP connect failure");
+                        }
+                    });
+                }
                 ProxyError::ConnectionError(format!(
                     "Failed to connect to {}:{}: {}",
                     connect_ip, 443, e
                 ))
             })?;
 
-            // Set TCP_NODELAY to disable Nagle's algorithm for lower latency
-            if let Err(e) = tcp.set_nodelay(true) {
-                warn!(
-                    "[HTTPS_CONNECTOR] Failed to set TCP_NODELAY for {}:{}: {}",
-                    connect_ip, 443, e
-                );
-            }
+            // Apply TCP socket options (keepalive + receive buffer) via socket2
+            let tcp = apply_socket_options(tcp, &config)?;
 
             debug!(
                 "[HTTPS_CONNECTOR] TCP connection established to {}:443",
                 connect_ip
             );
 
-            // Perform TLS handshake using the original hostname for SNI (Requirement 2.1)
+            // TLS handshake
             let server_name =
                 ServerName::try_from(tls_hostname.clone()).map_err(|e| {
                     ProxyError::TlsError(format!(
@@ -222,6 +272,18 @@ impl Service<Uri> for CustomHttpsConnector {
                     "[HTTPS_CONNECTOR] TLS handshake failed to {} ({}): {}",
                     tls_hostname, connect_ip, e
                 );
+                // Record failure for health tracking
+                if health_tracker.record_failure(&connect_ip) {
+                    warn!(ip = %connect_ip, "IP failure threshold reached on TLS handshake, excluding");
+                    let pm = pool_manager.clone();
+                    let host = tls_hostname.clone();
+                    tokio::spawn(async move {
+                        let mut pm = pm.write().await;
+                        if let Some(dist) = pm.get_distributor_mut(&host) {
+                            dist.remove_ip(connect_ip, "TLS handshake failure");
+                        }
+                    });
+                }
                 ProxyError::TlsError(format!(
                     "TLS handshake failed to {} ({}): {}",
                     tls_hostname, connect_ip, e
@@ -241,10 +303,6 @@ impl Service<Uri> for CustomHttpsConnector {
                     .await
                     .record_connection_created(&tls_hostname)
                     .await;
-                debug!(
-                    "[HTTPS_CONNECTOR] Recorded connection creation for endpoint: {}",
-                    tls_hostname
-                );
             }
 
             Ok(HttpsStream::new(tls))
@@ -257,6 +315,8 @@ impl Clone for CustomHttpsConnector {
         Self {
             pool_manager: Arc::clone(&self.pool_manager),
             tls_connector: self.tls_connector.clone(),
+            config: self.config.clone(),
+            health_tracker: Arc::clone(&self.health_tracker),
             metrics_manager: self.metrics_manager.clone(),
         }
     }
@@ -266,34 +326,17 @@ impl Clone for CustomHttpsConnector {
 mod tests {
     use super::*;
     use crate::config::ConnectionPoolConfig;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn test_connector_creation() {
-        // Install default crypto provider for Rustls
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        // Create a test ConnectionPoolManager
-        let config = ConnectionPoolConfig {
-            max_connections_per_ip: 10,
-            dns_refresh_interval: Duration::from_secs(60),
-            connection_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(60),
-            keepalive_enabled: true,
-            max_idle_per_host: 1,
-            max_lifetime: Duration::from_secs(300),
-            pool_check_interval: Duration::from_secs(10),
-            dns_servers: Vec::new(),
-            endpoint_overrides: std::collections::HashMap::new(),
-            ip_distribution_enabled: false,
-            max_idle_per_ip: 10,
-        };
+        let config = ConnectionPoolConfig::default();
 
-        let pool_manager = Arc::new(tokio::sync::Mutex::new(
-            ConnectionPoolManager::new_with_config(config).unwrap(),
+        let pool_manager = Arc::new(tokio::sync::RwLock::new(
+            ConnectionPoolManager::new_with_config(config.clone()).unwrap(),
         ));
 
-        // Create TLS connector
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -302,11 +345,11 @@ mod tests {
             .with_no_client_auth();
 
         let tls_connector = TlsConnector::from(Arc::new(tls_config));
+        let health_tracker = Arc::new(IpHealthTracker::new(3));
 
-        // Create connector
-        let connector = CustomHttpsConnector::new(pool_manager, tls_connector);
+        let connector =
+            CustomHttpsConnector::new(pool_manager, tls_connector, config, health_tracker);
 
-        // Verify connector can be cloned
         let _connector2 = connector.clone();
     }
 }

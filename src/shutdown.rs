@@ -12,14 +12,14 @@ use crate::{ProxyError, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 /// Shutdown coordinator for graceful system shutdown
 pub struct ShutdownCoordinator {
     cache_manager: Option<Arc<CacheManager>>,
-    connection_pool: Option<Arc<Mutex<ConnectionPoolManager>>>,
+    connection_pool: Option<Arc<RwLock<ConnectionPoolManager>>>,
     /// Logger manager for flushing access log buffer on shutdown
     logger_manager: Option<Arc<Mutex<LoggerManager>>>,
     /// Journal consolidator for running final consolidation and persisting size state
@@ -49,7 +49,7 @@ impl ShutdownCoordinator {
     }
 
     /// Set connection pool reference
-    pub fn set_connection_pool(&mut self, connection_pool: Arc<Mutex<ConnectionPoolManager>>) {
+    pub fn set_connection_pool(&mut self, connection_pool: Arc<RwLock<ConnectionPoolManager>>) {
         self.connection_pool = Some(connection_pool);
     }
 
@@ -286,13 +286,11 @@ impl ShutdownCoordinator {
     /// Close all connection pools gracefully
     async fn close_connection_pools(
         &self,
-        connection_pool: &Arc<Mutex<ConnectionPoolManager>>,
+        _connection_pool: &Arc<RwLock<ConnectionPoolManager>>,
     ) -> Result<()> {
-        let mut pool_manager = connection_pool.lock().await;
-
-        // Close all connections gracefully
-        pool_manager.close_all_connections().await?;
-
+        // Hyper manages actual TCP connections; nothing to close here.
+        // The pool manager only tracks DNS/IP distribution state.
+        info!("Connection pool manager shutdown (hyper manages TCP connections)");
         Ok(())
     }
 
@@ -311,12 +309,9 @@ impl ShutdownCoordinator {
     pub async fn force_shutdown(&self) -> Result<()> {
         warn!("Performing force shutdown");
 
-        // Force close connection pools without waiting
-        if let Some(connection_pool) = &self.connection_pool {
-            let mut pool_manager = connection_pool.lock().await;
-            if let Err(e) = pool_manager.force_close_all_connections().await {
-                error!("Error during force connection pool closure: {}", e);
-            }
+        // Hyper manages actual TCP connections; nothing to force-close here.
+        if self.connection_pool.is_some() {
+            info!("Connection pool manager force shutdown (hyper manages TCP connections)");
         }
 
         // Force release cache locks

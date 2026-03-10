@@ -18,10 +18,8 @@ fn create_keepalive_config() -> ConnectionPoolConfig {
         max_idle_per_host: 2,
         max_lifetime: Duration::from_secs(300),
         pool_check_interval: Duration::from_secs(10),
-        dns_servers: Vec::new(),
-        endpoint_overrides: std::collections::HashMap::new(),
         ip_distribution_enabled: false,
-        max_idle_per_ip: 10,
+        ..Default::default()
     }
 }
 
@@ -36,10 +34,8 @@ fn create_no_keepalive_config() -> ConnectionPoolConfig {
         max_idle_per_host: 0,
         max_lifetime: Duration::from_secs(300),
         pool_check_interval: Duration::from_secs(10),
-        dns_servers: Vec::new(),
-        endpoint_overrides: std::collections::HashMap::new(),
         ip_distribution_enabled: false,
-        max_idle_per_ip: 10,
+        ..Default::default()
     }
 }
 
@@ -85,10 +81,8 @@ async fn test_connection_pool_config_validation() {
         max_idle_per_host: 10,
         max_lifetime: Duration::from_secs(60),
         pool_check_interval: Duration::from_secs(5),
-        dns_servers: Vec::new(),
-        endpoint_overrides: std::collections::HashMap::new(),
         ip_distribution_enabled: false,
-        max_idle_per_ip: 10,
+        ..Default::default()
     };
 
     // Verify values are within reasonable ranges

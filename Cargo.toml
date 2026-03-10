@@ -1,6 +1,6 @@
 [package]
 name = "s3-proxy"
-version = "1.8.6"
+version = "1.9.0"
 edition = "2021"
 
 [dependencies]
@@ -51,6 +51,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Networking and DNS
 trust-dns-resolver = "0.23"
+socket2 = { version = "0.5", features = ["all"] }
 
 # Configuration
 clap = { version = "4.0", features = ["derive"] }

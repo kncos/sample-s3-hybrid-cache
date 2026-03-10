@@ -47,7 +47,7 @@ pub struct SystemHealth {
 pub struct HealthManager {
     start_time: SystemTime,
     cache_manager: Option<Arc<CacheManager>>,
-    connection_pool: Option<Arc<tokio::sync::Mutex<ConnectionPoolManager>>>,
+    connection_pool: Option<Arc<tokio::sync::RwLock<ConnectionPoolManager>>>,
     compression_handler: Option<Arc<CompressionHandler>>,
     last_health_check: Arc<RwLock<Option<SystemHealth>>>,
 }
@@ -77,7 +77,7 @@ impl HealthManager {
     /// Set connection pool reference
     pub fn set_connection_pool(
         &mut self,
-        connection_pool: Arc<tokio::sync::Mutex<ConnectionPoolManager>>,
+        connection_pool: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     ) {
         self.connection_pool = Some(connection_pool);
     }
@@ -104,7 +104,7 @@ impl HealthManager {
 
         // Collect IP distribution stats if any distributors are active
         let ip_distribution = if let Some(connection_pool) = &self.connection_pool {
-            let pool = connection_pool.lock().await;
+            let pool = connection_pool.read().await;
             let stats = pool.get_ip_distribution_stats();
             if stats.endpoints.is_empty() {
                 None
@@ -178,50 +178,34 @@ impl HealthManager {
     /// Check connection pool health
     async fn check_connection_pool_health(
         &self,
-        connection_pool: &Arc<tokio::sync::Mutex<ConnectionPoolManager>>,
+        connection_pool: &Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     ) -> ComponentHealth {
         let start_time = SystemTime::now();
+        let pool = connection_pool.read().await;
+        let stats = pool.get_ip_distribution_stats();
+        let response_time = start_time
+            .elapsed()
+            .unwrap_or(Duration::from_millis(0))
+            .as_millis() as u64;
 
-        match connection_pool.lock().await.get_health_metrics().await {
-            Ok(metrics) => {
-                let response_time = start_time
-                    .elapsed()
-                    .unwrap_or(Duration::from_millis(0))
-                    .as_millis() as u64;
+        let total_ips: usize = stats.endpoints.iter().map(|e| e.total_distributor_ips).sum();
+        let status = if total_ips > 0 {
+            HealthStatus::Healthy
+        } else {
+            // No IPs in any distributor — may be pre-DNS-refresh or all excluded
+            HealthStatus::Degraded
+        };
 
-                // Consider connection pool degraded if success rate is below 90%
-                let overall_success_rate = if metrics.is_empty() {
-                    1.0
-                } else {
-                    metrics.iter().map(|m| m.success_rate).sum::<f32>() / metrics.len() as f32
-                };
-
-                let status = if overall_success_rate < 0.9 {
-                    HealthStatus::Degraded
-                } else if overall_success_rate < 0.5 {
-                    HealthStatus::Unhealthy
-                } else {
-                    HealthStatus::Healthy
-                };
-
-                ComponentHealth {
-                    name: "connection_pool".to_string(),
-                    status,
-                    message: Some(format!(
-                        "Success rate: {:.1}%",
-                        overall_success_rate * 100.0
-                    )),
-                    last_check: start_time,
-                    response_time_ms: Some(response_time),
-                }
-            }
-            Err(e) => ComponentHealth {
-                name: "connection_pool".to_string(),
-                status: HealthStatus::Unhealthy,
-                message: Some(format!("Connection pool error: {}", e)),
-                last_check: start_time,
-                response_time_ms: None,
-            },
+        ComponentHealth {
+            name: "connection_pool".to_string(),
+            status,
+            message: Some(format!(
+                "{} endpoints, {} total IPs",
+                stats.endpoints.len(),
+                total_ips
+            )),
+            last_check: start_time,
+            response_time_ms: Some(response_time),
         }
     }
 

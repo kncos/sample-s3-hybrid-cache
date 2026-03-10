@@ -288,7 +288,7 @@ pub struct BucketCacheStats {
 pub struct MetricsManager {
     start_time: SystemTime,
     cache_manager: Option<Arc<CacheManager>>,
-    connection_pool: Option<Arc<tokio::sync::Mutex<ConnectionPoolManager>>>,
+    connection_pool: Option<Arc<tokio::sync::RwLock<ConnectionPoolManager>>>,
     compression_handler: Option<Arc<CompressionHandler>>,
     cache_size_tracker: Option<Arc<CacheSizeTracker>>,
     request_stats: Arc<RwLock<RequestStats>>,
@@ -499,7 +499,7 @@ impl MetricsManager {
     /// Set connection pool reference
     pub fn set_connection_pool(
         &mut self,
-        connection_pool: Arc<tokio::sync::Mutex<ConnectionPoolManager>>,
+        connection_pool: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     ) {
         self.connection_pool = Some(connection_pool);
     }
@@ -766,9 +766,9 @@ impl MetricsManager {
     /// Collect connection pool metrics
     async fn collect_connection_pool_metrics(
         &self,
-        connection_pool: &Arc<tokio::sync::Mutex<ConnectionPoolManager>>,
+        connection_pool: &Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     ) -> Option<ConnectionPoolMetrics> {
-        let pool_manager = connection_pool.lock().await;
+        let pool_manager = connection_pool.read().await;
 
         let dns_refresh_count = pool_manager.get_dns_refresh_count();
 
@@ -781,64 +781,26 @@ impl MetricsManager {
         let error_closures = keepalive_stats.error_closures;
         drop(keepalive_stats);
 
-        // Get health metrics for latency and success rate
-        match pool_manager.get_health_metrics().await {
-            Ok(health_metrics) => {
-                let failed_connections: u64 =
-                    health_metrics.iter().map(|m| m.failed_requests).sum();
+        // Get IP addresses from distributors
+        let stats = pool_manager.get_ip_distribution_stats();
+        let ip_addresses: Vec<String> = stats
+            .endpoints
+            .iter()
+            .flat_map(|e| e.ips.iter().map(|ip| ip.ip.clone()))
+            .collect();
 
-                let average_latency_ms = if !health_metrics.is_empty() {
-                    health_metrics
-                        .iter()
-                        .map(|m| m.average_latency.as_millis() as u64)
-                        .sum::<u64>()
-                        / health_metrics.len() as u64
-                } else {
-                    0
-                };
-
-                let success_rate = if !health_metrics.is_empty() {
-                    health_metrics.iter().map(|m| m.success_rate).sum::<f32>()
-                        / health_metrics.len() as f32
-                } else {
-                    1.0
-                };
-
-                let ip_addresses: Vec<String> = health_metrics
-                    .iter()
-                    .map(|m| m.ip_address.to_string())
-                    .collect();
-
-                Some(ConnectionPoolMetrics {
-                    failed_connections,
-                    average_latency_ms,
-                    success_rate_percent: success_rate,
-                    dns_refresh_count,
-                    ip_addresses,
-                    connections_created,
-                    connections_reused,
-                    idle_timeout_closures,
-                    max_lifetime_closures,
-                    error_closures,
-                })
-            }
-            Err(e) => {
-                warn!("Failed to collect connection pool health metrics: {}", e);
-                // Still return keepalive metrics even if health metrics fail
-                Some(ConnectionPoolMetrics {
-                    failed_connections: 0,
-                    average_latency_ms: 0,
-                    success_rate_percent: 1.0,
-                    dns_refresh_count,
-                    ip_addresses: Vec::new(),
-                    connections_created,
-                    connections_reused,
-                    idle_timeout_closures,
-                    max_lifetime_closures,
-                    error_closures,
-                })
-            }
-        }
+        Some(ConnectionPoolMetrics {
+            failed_connections: 0,
+            average_latency_ms: 0,
+            success_rate_percent: 1.0,
+            dns_refresh_count,
+            ip_addresses,
+            connections_created,
+            connections_reused,
+            idle_timeout_closures,
+            max_lifetime_closures,
+            error_closures,
+        })
     }
 
     /// Collect request processing metrics

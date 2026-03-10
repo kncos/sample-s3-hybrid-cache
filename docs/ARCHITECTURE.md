@@ -131,7 +131,7 @@ src/
 │
 │   # Networking and compression
 ├── compression.rs       # LZ4 compression with content-aware detection
-├── connection_pool.rs   # Connection pooling and load balancing
+├── connection_pool.rs   # IP distribution, DNS resolution, and health tracking
 │
 │   # Observability
 ├── logging.rs           # Access and application logging

@@ -439,7 +439,7 @@ impl HttpProxy {
     /// Get reference to S3 client's connection pool for health/metrics monitoring
     pub fn get_connection_pool(
         &self,
-    ) -> Arc<tokio::sync::Mutex<crate::connection_pool::ConnectionPoolManager>> {
+    ) -> Arc<tokio::sync::RwLock<crate::connection_pool::ConnectionPoolManager>> {
         self.s3_client.get_connection_pool()
     }
 
@@ -2019,13 +2019,14 @@ impl HttpProxy {
 
             // Get connection pool to resolve DNS and get target IP
             let pool = s3_client.get_connection_pool();
-            let mut pool_manager = pool.lock().await;
+            let pool_manager = pool.read().await;
 
-            // Resolve DNS to get target IP
-            match pool_manager.get_connection(&host, None).await {
-                Ok(connection) => {
-                    let target_ip = connection.ip_address;
-                    drop(pool_manager); // Release lock
+            // Get distributed IP for the host
+            let target_ip_opt = pool_manager.get_distributed_ip(&host);
+            drop(pool_manager);
+
+            match target_ip_opt {
+                Some(target_ip) => {
 
                     // Create TLS connector
                     let mut root_store = rustls::RootCertStore::empty();
@@ -2101,8 +2102,8 @@ impl HttpProxy {
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Failed to get connection for signed PUT request: {}", e);
+                None => {
+                    error!("No distributed IP available for signed PUT request to {}", host);
                     Ok(Self::build_error_response(
                         StatusCode::BAD_GATEWAY,
                         "BadGateway",
@@ -6942,13 +6943,14 @@ impl HttpProxy {
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Get connection pool to resolve DNS and get target IP
         let pool = s3_client.get_connection_pool();
-        let mut pool_manager = pool.lock().await;
+        let pool_manager = pool.read().await;
 
-        // Resolve DNS to get target IP
-        match pool_manager.get_connection(&host, None).await {
-            Ok(connection) => {
-                let target_ip = connection.ip_address;
-                drop(pool_manager); // Release lock
+        // Get distributed IP for the host
+        let target_ip_opt = pool_manager.get_distributed_ip(&host);
+        drop(pool_manager);
+
+        match target_ip_opt {
+            Some(target_ip) => {
 
                 // Create TLS connector
                 let mut root_store = rustls::RootCertStore::empty();
@@ -7004,8 +7006,8 @@ impl HttpProxy {
                     }
                 }
             }
-            Err(e) => {
-                error!("Failed to get connection for signed request: {}", e);
+            None => {
+                error!("No distributed IP available for signed request to {}", host);
                 Ok(Self::build_error_response(
                     StatusCode::BAD_GATEWAY,
                     "BadGateway",

@@ -5,7 +5,7 @@
 
 use crate::cache_types::CacheMetadata;
 use crate::config::ConnectionPoolConfig;
-use crate::connection_pool::{Connection, ConnectionPoolManager};
+use crate::connection_pool::{ConnectionPoolManager, IpHealthTracker};
 use crate::https_connector::CustomHttpsConnector;
 use crate::{ProxyError, Result};
 use bytes::Bytes;
@@ -18,19 +18,19 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 /// S3 client with Hyper connection pooling support
 pub struct S3Client {
     client: Client<CustomHttpsConnector, Full<Bytes>>,
-    pool_manager: Arc<Mutex<ConnectionPoolManager>>,
+    pool_manager: Arc<tokio::sync::RwLock<ConnectionPoolManager>>,
     request_timeout: Duration,
     keepalive_enabled: bool,
     ip_distribution_enabled: bool,
     metrics_manager:
         Arc<tokio::sync::RwLock<Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>>>,
+    health_tracker: Arc<IpHealthTracker>,
 }
 
 /// S3 request context for forwarding
@@ -131,9 +131,11 @@ impl S3Client {
         config: &ConnectionPoolConfig,
         metrics_manager: Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
     ) -> Result<Self> {
-        let pool_manager = Arc::new(Mutex::new(ConnectionPoolManager::new_with_config(
-            config.clone(),
-        )?));
+        let pool_manager = Arc::new(tokio::sync::RwLock::new(
+            ConnectionPoolManager::new_with_config(config.clone())?,
+        ));
+
+        let health_tracker = Arc::new(IpHealthTracker::new(config.ip_failure_threshold));
 
         // Create TLS connector for HTTPS connections to S3 with system root certificates
         let mut root_store = rustls::RootCertStore::empty();
@@ -156,17 +158,18 @@ impl S3Client {
         // Create shared metrics manager reference that can be set later
         let metrics_ref = Arc::new(tokio::sync::RwLock::new(metrics_manager.clone()));
 
-        // Create custom HTTPS connector with shared metrics manager reference
-        let mut https_connector =
-            CustomHttpsConnector::new(Arc::clone(&pool_manager), tls_connector);
+        // Create custom HTTPS connector with pool manager, health tracker, and config
+        let mut https_connector = CustomHttpsConnector::new(
+            Arc::clone(&pool_manager),
+            tls_connector,
+            config.clone(),
+            Arc::clone(&health_tracker),
+        );
 
         // Set the shared metrics manager reference on connector
-        // This allows metrics to be set later via set_metrics_manager()
         https_connector.set_metrics_manager_ref(Arc::clone(&metrics_ref));
 
         // Build Hyper client with connection pooling
-        // When IP distribution is enabled, each IP gets its own hyper pool keyed by
-        // (scheme, ip, port), so use the per-IP idle limit instead of the per-host limit.
         let pool_max_idle = if config.ip_distribution_enabled {
             config.max_idle_per_ip
         } else {
@@ -188,7 +191,6 @@ impl S3Client {
         } else {
             debug!("Creating S3 client with connection keepalive disabled");
 
-            // Disable pooling by setting idle timeout to 0
             Client::builder(TokioExecutor::new())
                 .pool_idle_timeout(Duration::from_secs(0))
                 .pool_max_idle_per_host(0)
@@ -202,6 +204,7 @@ impl S3Client {
             keepalive_enabled: config.keepalive_enabled,
             ip_distribution_enabled: config.ip_distribution_enabled,
             metrics_manager: metrics_ref,
+            health_tracker,
         })
     }
 
@@ -216,7 +219,7 @@ impl S3Client {
     /// Get reference to connection pool manager for health/metrics monitoring
     pub fn get_connection_pool(
         &self,
-    ) -> Arc<tokio::sync::Mutex<crate::connection_pool::ConnectionPoolManager>> {
+    ) -> Arc<tokio::sync::RwLock<crate::connection_pool::ConnectionPoolManager>> {
         Arc::clone(&self.pool_manager)
     }
 
@@ -318,9 +321,9 @@ impl S3Client {
 
         // IP distribution: rewrite URI authority from hostname to IP address so hyper
         // creates separate connection pools per IP (Requirement 1.1, 1.2)
-        let effective_uri = if self.ip_distribution_enabled {
+        let (effective_uri, selected_ip) = if self.ip_distribution_enabled {
             let distributed_ip = {
-                let mut pool_manager = self.pool_manager.lock().await;
+                let pool_manager = self.pool_manager.read().await;
                 pool_manager.get_distributed_ip(&context.host)
             };
             match distributed_ip {
@@ -331,24 +334,24 @@ impl S3Client {
                         "Selected distributed IP for request"
                     );
                     match rewrite_uri_authority(&context.uri, &ip) {
-                        Ok(new_uri) => new_uri,
+                        Ok(new_uri) => (new_uri, Some(ip)),
                         Err(e) => {
                             warn!(
                                 error = %e,
                                 host = %context.host,
                                 "URI authority rewrite failed, forwarding with original hostname"
                             );
-                            context.uri.clone()
+                            (context.uri.clone(), Some(ip))
                         }
                     }
                 }
                 None => {
                     // No IPs available — forward with original hostname (Requirement 7.1)
-                    context.uri.clone()
+                    (context.uri.clone(), None)
                 }
             }
         } else {
-            context.uri.clone()
+            (context.uri.clone(), None)
         };
 
         // Build HTTP request
@@ -401,7 +404,29 @@ impl S3Client {
         let response = tokio::time::timeout(self.request_timeout, self.client.request(request))
             .await
             .map_err(|_| ProxyError::TimeoutError("Request timeout".to_string()))?
-            .map_err(|e| ProxyError::HttpError(format!("Failed to send request: {}", e)))?;
+            .map_err(|e| {
+                // Record failure for IP health tracking
+                if let Some(ip) = selected_ip {
+                    if self.health_tracker.record_failure(&ip) {
+                        warn!(ip = %ip, host = %context.host, "IP failure threshold reached, excluding from distributor");
+                        // Acquire write lock to remove IP — this is rare (only on threshold)
+                        let pool_manager = self.pool_manager.clone();
+                        let host = context.host.clone();
+                        tokio::spawn(async move {
+                            let mut pm = pool_manager.write().await;
+                            if let Some(dist) = pm.get_distributor_mut(&host) {
+                                dist.remove_ip(ip, "consecutive failures");
+                            }
+                        });
+                    }
+                }
+                ProxyError::HttpError(format!("Failed to send request: {}", e))
+            })?;
+
+        // Record success for IP health tracking
+        if let Some(ip) = selected_ip {
+            self.health_tracker.record_success(&ip);
+        }
 
         // Read response
         let (parts, body) = response.into_parts();
@@ -515,29 +540,10 @@ impl S3Client {
         }
     }
 
-    /// Refresh DNS for all connection pools (Requirement 16.2)
+    /// Refresh DNS for all connection pools
     pub async fn refresh_dns(&self) -> Result<()> {
-        let mut pool_manager = self.pool_manager.lock().await;
+        let mut pool_manager = self.pool_manager.write().await;
         pool_manager.refresh_dns().await
-    }
-
-    /// Monitor connection health across all pools (Requirement 16.3)
-    pub async fn monitor_connection_health(&self) -> Result<()> {
-        let mut pool_manager = self.pool_manager.lock().await;
-        pool_manager.monitor_connection_health().await
-    }
-
-    /// Get multiple connections for large requests (Requirement 16.6)
-    pub async fn get_multiple_connections(
-        &self,
-        endpoint: &str,
-        request_size: Option<u64>,
-        connection_count: usize,
-    ) -> Result<Vec<Connection>> {
-        let mut pool_manager = self.pool_manager.lock().await;
-        pool_manager
-            .get_multiple_connections(endpoint, request_size, connection_count)
-            .await
     }
     /// Build conditional request headers for cache validation (Requirements 4.1, 4.2, 4.3, 4.4, 3.6, 3.8)
     pub fn build_conditional_headers(
@@ -1020,6 +1026,7 @@ mod tests {
             endpoint_overrides: std::collections::HashMap::new(),
             ip_distribution_enabled: false,
             max_idle_per_ip: 10,
+            ..Default::default()
         }
     }
 

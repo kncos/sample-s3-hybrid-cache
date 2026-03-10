@@ -289,7 +289,7 @@ connection_pool:
   max_connections_per_ip: 50
   dns_refresh_interval: "60s"  # 1 minute
   connection_timeout: "10s"
-  idle_timeout: "60s"
+  idle_timeout: "55s"  # Just under S3's ~60s server-side timeout to avoid reusing stale connections
   keepalive_enabled: true
   max_idle_per_host: 100  # More idle connections = more memory, fewer TLS handshakes during bursts
   max_lifetime: "300s"
@@ -313,6 +313,18 @@ connection_pool:
   # When IP distribution is disabled, max_idle_per_host (above) is used instead.
   # Valid range: 1-100
   max_idle_per_ip: 10
+  # TCP keepalive settings applied via socket2 before TLS handshake.
+  # Detects dead connections at the TCP layer before hyper tries to reuse them.
+  keepalive_idle_secs: 15     # Seconds idle before first probe (default: 15)
+  keepalive_interval_secs: 5  # Seconds between probes (default: 5)
+  keepalive_retries: 3        # Failed probes before connection is dead (default: 3)
+  # TCP receive buffer size hint in bytes (default: 262144 = 256KB).
+  # Larger buffers improve throughput for large object downloads.
+  # Set to null to use kernel default. Kernel may cap at net.core.rmem_max.
+  tcp_recv_buffer_size: 262144
+  # Consecutive failures before excluding an IP from round-robin distribution (default: 3).
+  # Excluded IPs are restored on the next DNS refresh (every dns_refresh_interval).
+  ip_failure_threshold: 3
 
 compression:
   enabled: true

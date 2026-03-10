@@ -41,6 +41,7 @@ fn create_test_config() -> ConnectionPoolConfig {
         endpoint_overrides: std::collections::HashMap::new(),
         ip_distribution_enabled: false,
         max_idle_per_ip: 10,
+        ..Default::default()
     }
 }
 

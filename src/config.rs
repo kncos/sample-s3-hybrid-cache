@@ -1311,6 +1311,21 @@ pub struct ConnectionPoolConfig {
     /// Valid range: 1-100
     #[serde(default = "default_max_idle_per_ip")]
     pub max_idle_per_ip: usize,
+    /// TCP keepalive idle time in seconds before probing begins (default: 15)
+    #[serde(default = "default_keepalive_idle_secs")]
+    pub keepalive_idle_secs: u64,
+    /// TCP keepalive probe interval in seconds (default: 5)
+    #[serde(default = "default_keepalive_interval_secs")]
+    pub keepalive_interval_secs: u64,
+    /// TCP keepalive probe retry count (default: 3)
+    #[serde(default = "default_keepalive_retries")]
+    pub keepalive_retries: u32,
+    /// TCP receive buffer size hint in bytes (default: 256KB). None = kernel default.
+    #[serde(default = "default_tcp_recv_buffer_size")]
+    pub tcp_recv_buffer_size: Option<usize>,
+    /// Consecutive failures before excluding an IP from round-robin (default: 3)
+    #[serde(default = "default_ip_failure_threshold")]
+    pub ip_failure_threshold: u32,
 }
 
 fn default_dns_servers() -> Vec<String> {
@@ -1341,6 +1356,26 @@ fn default_ip_distribution_enabled() -> bool {
     true
 }
 
+fn default_keepalive_idle_secs() -> u64 {
+    15
+}
+
+fn default_keepalive_interval_secs() -> u64 {
+    5
+}
+
+fn default_keepalive_retries() -> u32 {
+    3
+}
+
+fn default_tcp_recv_buffer_size() -> Option<usize> {
+    Some(262144) // 256 KB
+}
+
+fn default_ip_failure_threshold() -> u32 {
+    3
+}
+
 
 impl Default for ConnectionPoolConfig {
     fn default() -> Self {
@@ -1348,7 +1383,7 @@ impl Default for ConnectionPoolConfig {
             max_connections_per_ip: 10,
             dns_refresh_interval: Duration::from_secs(60),
             connection_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(55),
             keepalive_enabled: default_keepalive_enabled(),
             max_idle_per_host: default_max_idle_per_host(),
             max_lifetime: default_max_lifetime(),
@@ -1357,6 +1392,11 @@ impl Default for ConnectionPoolConfig {
             endpoint_overrides: std::collections::HashMap::new(),
             ip_distribution_enabled: true,
             max_idle_per_ip: default_max_idle_per_ip(),
+            keepalive_idle_secs: default_keepalive_idle_secs(),
+            keepalive_interval_secs: default_keepalive_interval_secs(),
+            keepalive_retries: default_keepalive_retries(),
+            tcp_recv_buffer_size: default_tcp_recv_buffer_size(),
+            ip_failure_threshold: default_ip_failure_threshold(),
         }
     }
 }
@@ -1558,7 +1598,13 @@ impl Default for Config {
                 pool_check_interval: Duration::from_secs(10), // 10 seconds
                 dns_servers: Vec::new(),                // Default: Google DNS + Cloudflare DNS
                 endpoint_overrides: std::collections::HashMap::new(),
-                ip_distribution_enabled: true,                max_idle_per_ip: default_max_idle_per_ip(),
+                ip_distribution_enabled: true,
+                max_idle_per_ip: default_max_idle_per_ip(),
+                keepalive_idle_secs: default_keepalive_idle_secs(),
+                keepalive_interval_secs: default_keepalive_interval_secs(),
+                keepalive_retries: default_keepalive_retries(),
+                tcp_recv_buffer_size: default_tcp_recv_buffer_size(),
+                ip_failure_threshold: default_ip_failure_threshold(),
             },
             compression: CompressionConfig {
                 enabled: true,
@@ -3322,7 +3368,7 @@ metrics:
         assert_eq!(config.max_connections_per_ip, 10);
         assert_eq!(config.dns_refresh_interval, Duration::from_secs(60));
         assert_eq!(config.connection_timeout, Duration::from_secs(10));
-        assert_eq!(config.idle_timeout, Duration::from_secs(30));
+        assert_eq!(config.idle_timeout, Duration::from_secs(55));
         assert_eq!(config.keepalive_enabled, true);
         assert_eq!(config.max_idle_per_host, 100);
         assert_eq!(config.max_lifetime, Duration::from_secs(300));
@@ -3372,6 +3418,7 @@ pool_check_interval: "20s"
             endpoint_overrides: std::collections::HashMap::new(),
             ip_distribution_enabled: false,
             max_idle_per_ip: 10,
+            ..Default::default()
         };
 
         // Verify values are within reasonable ranges
