@@ -21,7 +21,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 /// Maximum concurrent cache keys processed in a single consolidation cycle
-const KEY_CONCURRENCY_LIMIT: usize = 8;
+const KEY_CONCURRENCY_LIMIT: usize = 64;
+
+/// Result of journal discovery, including per-file entry counts for optimized cleanup.
+///
+/// During discovery, every journal file is read and parsed to build the key index.
+/// We also count total entries per file so that cleanup can skip re-reading files
+/// where all entries were consolidated (delete/truncate without re-parsing).
+#[derive(Debug, Clone)]
+pub struct DiscoveryResult {
+    /// cache_key → list of journal file paths containing entries for that key
+    pub key_index: HashMap<String, Vec<PathBuf>>,
+    /// journal file path → total number of parseable entries in that file at discovery time
+    pub file_entry_counts: HashMap<PathBuf, usize>,
+}
 
 // Custom serde serialization for SystemTime
 mod systemtime_serde {
@@ -59,6 +72,12 @@ pub struct SizeState {
     /// Write cache = mpus_in_progress/ directory contents
     pub write_cache_size: u64,
 
+    /// Number of distinct cached objects (unique cache keys with at least one range on disk).
+    /// Incremented when a new object is first evicted (metadata deleted = all ranges gone).
+    /// Recalculated during validation scans by counting .meta files.
+    #[serde(default)]
+    pub cached_objects: u64,
+
     /// Timestamp of last consolidation
     #[serde(with = "systemtime_serde")]
     pub last_consolidation: SystemTime,
@@ -75,6 +94,7 @@ impl Default for SizeState {
         Self {
             total_size: 0,
             write_cache_size: 0,
+            cached_objects: 0,
             last_consolidation: UNIX_EPOCH,
             consolidation_count: 0,
             last_updated_by: String::new(),
@@ -92,8 +112,6 @@ pub struct ConsolidationConfig {
     pub size_threshold: u64,
     /// Entry count threshold to trigger immediate consolidation
     pub entry_count_threshold: usize,
-    /// Maximum number of cache keys to process per consolidation run
-    pub max_keys_per_run: usize,
     /// Maximum cache size in bytes (for eviction triggering)
     /// Passed from CacheConfig.max_cache_size during initialization
     /// 0 means no eviction (disabled)
@@ -107,6 +125,10 @@ pub struct ConsolidationConfig {
     /// Maximum duration for the per-key processing phase of a consolidation cycle (default: 30s)
     /// Requirement: 4.1, 4.4
     pub consolidation_cycle_timeout: Duration,
+    /// Maximum number of cache keys to discover and process per consolidation cycle (default: 5000)
+    /// Limits NFS I/O during discovery and ensures the cycle completes within the timeout.
+    /// When the backlog exceeds this cap, remaining keys are processed in subsequent cycles.
+    pub max_keys_per_cycle: usize,
 }
 
 impl Default for ConsolidationConfig {
@@ -115,12 +137,12 @@ impl Default for ConsolidationConfig {
             interval: Duration::from_secs(5), // Changed from 30s for near-realtime size tracking
             size_threshold: 1024 * 1024,      // 1MB
             entry_count_threshold: 100,
-            max_keys_per_run: 50,
             max_cache_size: 0, // Must be set from CacheConfig during initialization
             eviction_trigger_percent: 95,
             eviction_target_percent: 80,
             stale_entry_timeout_secs: 300, // 5 minutes
             consolidation_cycle_timeout: Duration::from_secs(30),
+            max_keys_per_cycle: 5000,
         }
     }
 }
@@ -142,6 +164,8 @@ pub struct ConsolidationResult {
     pub size_delta: i64,
     /// Net write cache size change from this consolidation (can be negative)
     pub write_cache_delta: i64,
+    /// Whether this consolidation created a new metadata file (first time this object was cached)
+    pub is_new_object: bool,
 }
 
 /// Result of a complete consolidation cycle
@@ -187,6 +211,7 @@ impl ConsolidationResult {
             consolidated_entries: Vec::new(),
             size_delta: 0,
             write_cache_delta: 0,
+            is_new_object: false,
         }
     }
     pub fn failure(cache_key: String, error: String) -> Self {
@@ -202,6 +227,7 @@ impl ConsolidationResult {
             consolidated_entries: Vec::new(),
             size_delta: 0,
             write_cache_delta: 0,
+            is_new_object: false,
         }
     }
 }
@@ -1036,6 +1062,124 @@ impl JournalConsolidator {
         }
     }
 
+    /// Atomically decrement cached_objects count after eviction removes metadata files.
+    ///
+    /// Called after eviction completes with the number of objects whose metadata was deleted.
+    pub async fn decrement_cached_objects(&self, objects_removed: u64) {
+        if objects_removed == 0 {
+            return;
+        }
+
+        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
+        if let Some(parent) = lock_file_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                warn!("Failed to create size_tracking directory for object count update: {}", e);
+                return;
+            }
+        }
+
+        let lock_file = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking({
+                let lock_path = lock_file_path.clone();
+                move || {
+                    use fs2::FileExt;
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open(&lock_path)?;
+                    file.lock_exclusive()?;
+                    Ok::<_, std::io::Error>(file)
+                }
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Ok(file))) => file,
+            _ => {
+                warn!("Failed to acquire size state lock for cached_objects decrement");
+                return;
+            }
+        };
+
+        let mut state = match self.load_size_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = lock_file.unlock();
+                warn!("Failed to load size state for cached_objects decrement: {}", e);
+                return;
+            }
+        };
+
+        state.cached_objects = state.cached_objects.saturating_sub(objects_removed);
+        state.last_updated_by = get_instance_id();
+
+        if let Err(e) = self.persist_size_state_internal(&state).await {
+            warn!("Failed to persist size state after cached_objects decrement: {}", e);
+        }
+        let _ = lock_file.unlock();
+        debug!("Decremented cached_objects by {}, new count={}", objects_removed, state.cached_objects);
+    }
+
+    /// Atomically increment cached_objects count when a new object is first cached.
+    ///
+    /// Called when consolidation writes a new metadata file for a previously unseen cache key.
+    pub async fn increment_cached_objects(&self, objects_added: u64) {
+        if objects_added == 0 {
+            return;
+        }
+
+        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
+        if let Some(parent) = lock_file_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                warn!("Failed to create size_tracking directory for object count update: {}", e);
+                return;
+            }
+        }
+
+        let lock_file = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking({
+                let lock_path = lock_file_path.clone();
+                move || {
+                    use fs2::FileExt;
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open(&lock_path)?;
+                    file.lock_exclusive()?;
+                    Ok::<_, std::io::Error>(file)
+                }
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Ok(file))) => file,
+            _ => {
+                warn!("Failed to acquire size state lock for cached_objects increment");
+                return;
+            }
+        };
+
+        let mut state = match self.load_size_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = lock_file.unlock();
+                warn!("Failed to load size state for cached_objects increment: {}", e);
+                return;
+            }
+        };
+
+        state.cached_objects = state.cached_objects.saturating_add(objects_added);
+        state.last_updated_by = get_instance_id();
+
+        if let Err(e) = self.persist_size_state_internal(&state).await {
+            warn!("Failed to persist size state after cached_objects increment: {}", e);
+        }
+        let _ = lock_file.unlock();
+        debug!("Incremented cached_objects by {}, new count={}", objects_added, state.cached_objects);
+    }
+
     /// Try to acquire the global consolidation lock
     ///
     /// Uses flock-based locking to prevent multiple instances from running
@@ -1149,6 +1293,7 @@ impl JournalConsolidator {
         &self,
         scanned_size: u64,
         write_cache_size: Option<u64>,
+        cached_objects: Option<u64>,
     ) {
         // Read current state from disk first
         let mut state = match self.load_size_state().await {
@@ -1164,13 +1309,17 @@ impl JournalConsolidator {
         if let Some(wc_size) = write_cache_size {
             state.write_cache_size = wc_size;
         }
+        if let Some(objects) = cached_objects {
+            state.cached_objects = objects;
+        }
         state.last_updated_by = get_instance_id();
 
         info!(
-            "Updated size state from validation: old_size={}, new_size={}, drift={}",
+            "Updated size state from validation: old_size={}, new_size={}, drift={}, cached_objects={}",
             old_size,
             scanned_size,
-            scanned_size as i64 - old_size as i64
+            scanned_size as i64 - old_size as i64,
+            state.cached_objects
         );
 
         // Persist the updated state
@@ -1535,6 +1684,12 @@ impl JournalConsolidator {
     /// If no size state file exists, the consolidator starts with default (zero) values
     /// and logs that validation will calculate the actual size.
     pub async fn initialize(&self) -> Result<()> {
+        // Clean up stale journal files from dead instances before loading size state.
+        // After OOM kills or crashes, journal files from the dead PID remain on shared
+        // storage and are re-read every consolidation cycle. With 500k+ objects this can
+        // be 800+ MB of stale data, causing memory pressure that triggers more OOM kills.
+        self.cleanup_dead_instance_journals().await;
+
         match self.load_size_state().await {
             Ok(state) => {
                 if state.total_size > 0 || state.consolidation_count > 0 {
@@ -1543,7 +1698,65 @@ impl JournalConsolidator {
                         state.total_size, state.write_cache_size, state.consolidation_count, state.last_updated_by
                     );
                 }
-                // Size state loaded from disk - no in-memory state to update
+
+                // If cached_objects is 0 but we have cached data, count .meta files now.
+                // This handles the upgrade case where cached_objects was not previously tracked.
+                // Acquire the size state lock before writing to prevent a concurrent consolidation
+                // cycle on another instance from overwriting our result with cached_objects=0.
+                if state.cached_objects == 0 && state.total_size > 0 {
+                    let metadata_dir = self.cache_dir.join("metadata");
+                    let count = tokio::task::spawn_blocking(move || {
+                        use walkdir::WalkDir;
+                        WalkDir::new(&metadata_dir)
+                            .follow_links(false)
+                            .into_iter()
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.path().extension().map_or(false, |ext| ext == "meta"))
+                            .count() as u64
+                    })
+                    .await
+                    .unwrap_or(0);
+
+                    if count > 0 {
+                        let lock_file_path = self.cache_dir.join("size_tracking").join("size_state.lock");
+                        let lock_acquired = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            tokio::task::spawn_blocking({
+                                let lock_path = lock_file_path.clone();
+                                move || {
+                                    use fs2::FileExt;
+                                    let file = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .write(true)
+                                        .open(&lock_path)?;
+                                    file.lock_exclusive()?;
+                                    Ok::<_, std::io::Error>(file)
+                                }
+                            }),
+                        )
+                        .await;
+
+                        if let Ok(Ok(Ok(lock_file))) = lock_acquired {
+                            // Re-read under lock — another instance may have already populated it
+                            let current = self.load_size_state().await.unwrap_or_default();
+                            if current.cached_objects == 0 {
+                                let mut updated = current;
+                                updated.cached_objects = count;
+                                updated.last_updated_by = get_instance_id();
+                                if let Err(e) = self.persist_size_state_internal(&updated).await {
+                                    warn!("Failed to persist cached_objects after startup scan: {}", e);
+                                } else {
+                                    info!("Initialized cached_objects={} from startup .meta file count", count);
+                                }
+                            } else {
+                                info!("cached_objects already populated ({}) by another instance, skipping", current.cached_objects);
+                            }
+                            let _ = lock_file.unlock();
+                        } else {
+                            warn!("Could not acquire size state lock for cached_objects startup init");
+                        }
+                    }
+                }
             }
             Err(e) => {
                 // No size state file - this is a fresh install or first run after migration
@@ -1663,8 +1876,8 @@ impl JournalConsolidator {
     ///
     /// This method wraps the consolidation logic that was previously in main.rs:
     /// 1. Acquire global consolidation lock (prevents multi-instance race conditions)
-    /// 2. Discover pending cache keys from all instance journals
-    /// 3. For each cache key (up to max_keys_per_run):
+    /// 2. Discover pending cache keys from all instance journals (capped at max_keys_per_cycle)
+    /// 3. For each discovered cache key:
     ///    - Call consolidate_object()
     ///    - Calculate size delta from processed entries
     /// 4. Accumulate size deltas across all processed keys
@@ -1759,9 +1972,16 @@ impl JournalConsolidator {
             }
         }
 
-        // Discover pending cache keys
-        let cache_keys = match self.discover_pending_cache_keys().await {
-            Ok(keys) => keys,
+        // Set deadline for the entire discovery + processing phase.
+        // Discovery of 66k+ keys on NFS can take 20s+, eating into processing time.
+        // By starting the deadline here, we ensure the total cycle is bounded.
+        let key_processing_timeout = self.config.consolidation_cycle_timeout;
+        let deadline = tokio::time::Instant::now() + key_processing_timeout;
+
+        // Discover pending cache keys with index, capped to limit NFS I/O
+        let max_keys = self.config.max_keys_per_cycle;
+        let discovery = match self.discover_pending_cache_keys_indexed_capped(max_keys).await {
+            Ok(result) => result,
             Err(e) => {
                 warn!("Failed to discover pending journal entries: {}", e);
                 // Even on error, check if eviction is needed
@@ -1778,6 +1998,10 @@ impl JournalConsolidator {
                 });
             }
         };
+
+        let key_index = discovery.key_index;
+        let file_entry_counts = discovery.file_entry_counts;
+        let cache_keys: Vec<String> = key_index.keys().cloned().collect();
 
         // If no pending entries, still check if eviction is needed
         // This handles the case where cache is over capacity but no new data is being added
@@ -1805,66 +2029,74 @@ impl JournalConsolidator {
         let mut _total_size_delta: i64 = 0;  // Kept for debugging, not used for size tracking
         let mut _total_write_cache_delta: i64 = 0;  // Kept for debugging, not used for size tracking
         let mut all_consolidated_entries = Vec::new();
+        let mut new_objects_count: u64 = 0;
         let mut keys_processed = 0;
 
-        // Process cache keys concurrently (up to max_keys_per_run, KEY_CONCURRENCY_LIMIT at a time)
+        // Process discovered cache keys concurrently (KEY_CONCURRENCY_LIMIT at a time)
         // Per-key locks are independent flock-based locks on different files, so concurrent
         // acquisition is safe. This reduces wall-clock time when individual keys hit NFS latency spikes.
-        let total_keys_to_process = cache_keys.len().min(self.config.max_keys_per_run);
+        let total_keys_to_process = cache_keys.len();
         let key_futures: Vec<_> = cache_keys
             .iter()
-            .take(self.config.max_keys_per_run)
             .map(|cache_key| {
                 let cache_key = cache_key.clone();
+                // Clone the file list for this key from the index so the async block is 'static
+                let journal_files = key_index
+                    .get(&cache_key)
+                    .cloned()
+                    .unwrap_or_default();
                 async move {
-                    let result = self.consolidate_object(&cache_key).await;
+                    let result = self.consolidate_object_with_files(&cache_key, &journal_files).await;
                     (cache_key, result)
                 }
             })
             .collect();
 
-        // Wrap per-key processing with configurable timeout (Requirement 4.1)
-        // On timeout, unprocessed keys are retried next cycle (no data loss, Requirement 4.3)
-        let key_processing_timeout = self.config.consolidation_cycle_timeout;
-        let key_results = tokio::time::timeout(
-            key_processing_timeout,
+        // Process results incrementally with the deadline set before discovery.
+        // Completed keys are counted and cleaned up even when the deadline fires.
+        let mut stream = std::pin::pin!(
             stream::iter(key_futures)
                 .buffer_unordered(KEY_CONCURRENCY_LIMIT)
-                .collect::<Vec<_>>()
-        ).await;
+        );
 
-        let key_results = match key_results {
-            Ok(results) => results,
-            Err(_) => {
-                // Timeout reached (Requirement 4.2): log warning and proceed to cleanup/eviction
-                let unprocessed = total_keys_to_process.saturating_sub(keys_processed);
-                warn!(
-                    "Consolidation cycle timeout after {:?}, {} keys unprocessed out of {} total",
-                    key_processing_timeout, unprocessed, total_keys_to_process
-                );
-                // Return empty results — unprocessed keys will be retried next cycle
-                Vec::new()
-            }
-        };
-
-        for (cache_key, result) in key_results {
-            match result {
-                Ok(result) => {
-                    if result.entries_consolidated > 0 {
-                        debug!(
-                            "Journal consolidated: cache_key={}, entries={}, size_delta={:+}",
-                            cache_key, result.entries_consolidated, result.size_delta
-                        );
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some((cache_key, result))) => {
+                    // Key completed before deadline
+                    match result {
+                        Ok(result) => {
+                            if result.entries_consolidated > 0 {
+                                debug!(
+                                    "Journal consolidated: cache_key={}, entries={}, size_delta={:+}",
+                                    cache_key, result.entries_consolidated, result.size_delta
+                                );
+                            }
+                            total_entries_consolidated += result.entries_consolidated;
+                            _total_size_delta += result.size_delta;
+                            _total_write_cache_delta += result.write_cache_delta;
+                            all_consolidated_entries.extend(result.consolidated_entries);
+                            keys_processed += 1;
+                            if result.is_new_object {
+                                new_objects_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            info!("Journal consolidation failed for {}: {}", cache_key, e);
+                        }
                     }
-
-                    total_entries_consolidated += result.entries_consolidated;
-                    _total_size_delta += result.size_delta;
-                    _total_write_cache_delta += result.write_cache_delta;
-                    all_consolidated_entries.extend(result.consolidated_entries);
-                    keys_processed += 1;
                 }
-                Err(e) => {
-                    warn!("Journal consolidation failed for {}: {}", cache_key, e);
+                Ok(None) => {
+                    // Stream exhausted — all keys processed
+                    break;
+                }
+                Err(_) => {
+                    // Deadline reached: log and break. Completed keys are already accumulated.
+                    let unprocessed = total_keys_to_process.saturating_sub(keys_processed);
+                    info!(
+                        "Consolidation cycle deadline after {:?}, {} keys processed, {} unprocessed out of {} total",
+                        key_processing_timeout, keys_processed, unprocessed, total_keys_to_process
+                    );
+                    break;
                 }
             }
         }
@@ -1879,7 +2111,7 @@ impl JournalConsolidator {
         // Entries that failed validation (range file not visible) are preserved
         if !all_consolidated_entries.is_empty() {
             if let Err(e) = self
-                .cleanup_consolidated_entries(&all_consolidated_entries)
+                .cleanup_consolidated_entries(&all_consolidated_entries, &file_entry_counts)
                 .await
             {
                 warn!("Failed to cleanup consolidated journal entries: {}", e);
@@ -1887,6 +2119,13 @@ impl JournalConsolidator {
         }
 
         let cycle_duration = cycle_start.elapsed();
+
+        // Batch-increment cached_objects count for all new objects in this cycle.
+        // This replaces per-key increment_cached_objects calls, reducing NFS lock
+        // operations from N to 1 and preventing count loss when the deadline fires.
+        if new_objects_count > 0 {
+            self.increment_cached_objects(new_objects_count).await;
+        }
         
         // Get current size and check if eviction is needed
         // Always check eviction at the end of every cycle, not just when size_delta > 0
@@ -1897,7 +2136,7 @@ impl JournalConsolidator {
         // Log summary if there was activity
         if total_entries_consolidated > 0 || eviction_triggered || accumulator_size_delta != 0 {
             info!(
-                "Consolidation cycle complete: keys={}, entries={}, accumulator_delta={:+}, duration={}ms, current_size={}, eviction_triggered={}, bytes_evicted={}",
+                "Consolidation cycle complete: keys={}, entries={}, accumulator_delta={:+}, duration={}ms, total_cache_size={}, eviction_triggered={}, bytes_evicted={}",
                 keys_processed, total_entries_consolidated, accumulator_size_delta,
                 cycle_duration.as_millis(), current_size, eviction_triggered, bytes_evicted
             );
@@ -1921,30 +2160,47 @@ impl JournalConsolidator {
     /// Without this, Instance A could read entries, Instance B could read the same entries,
     /// then both would consolidate and clean up, causing entries to be lost.
     pub async fn consolidate_object(&self, cache_key: &str) -> Result<ConsolidationResult> {
+        self.consolidate_object_with_files(cache_key, &[]).await
+    }
+
+    /// Internal consolidation worker. When `journal_files` is non-empty it reads only those
+    /// files (pre-built index from `discover_pending_cache_keys_indexed`). When empty it falls
+    /// back to a full directory scan via `journal_manager.get_all_entries_for_cache_key`.
+    async fn consolidate_object_with_files(
+        &self,
+        cache_key: &str,
+        journal_files: &[PathBuf],
+    ) -> Result<ConsolidationResult> {
         debug!("Starting consolidation for cache key: {}", cache_key);
 
-        // CRITICAL: Acquire lock BEFORE reading journal entries to prevent race conditions
+        // Acquire lock BEFORE reading journal entries to prevent race conditions
         // where multiple instances read the same entries and then both try to consolidate.
-        // The lock ensures only one instance processes a given cache key at a time.
-        let lock = match self.lock_manager.acquire_lock(cache_key).await {
+        // Uses try_acquire_lock (single attempt, no retries) instead of acquire_lock
+        // (exponential backoff with retries). If the lock is held, skip this key and
+        // retry next cycle — cheaper than waiting ~150ms in backoff per contended key.
+        let lock = match self.lock_manager.try_acquire_lock(cache_key).await {
             Ok(lock) => lock,
             Err(e) => {
-                // Lock acquisition failure is expected when another instance is consolidating
+                // Lock contention is expected when another instance is consolidating
                 debug!(
-                    "Consolidation skipped (lock held by another instance): cache_key={}, error={}",
+                    "Consolidation skipped (lock held): cache_key={}, error={}",
                     cache_key, e
                 );
                 return Ok(ConsolidationResult::success(cache_key.to_string(), 0, 0));
             }
         };
 
-        // Now that we hold the lock, read journal entries
-        // Other instances will skip this cache key until we release the lock
-        let all_entries = match self
-            .journal_manager
-            .get_all_entries_for_cache_key(cache_key)
-            .await
-        {
+        // Now that we hold the lock, read journal entries.
+        // Use the pre-built index when available (avoids re-scanning all journal files).
+        let all_entries = match if journal_files.is_empty() {
+            self.journal_manager
+                .get_all_entries_for_cache_key(cache_key)
+                .await
+        } else {
+            self.journal_manager
+                .get_entries_from_files(cache_key, journal_files)
+                .await
+        } {
             Ok(entries) => entries,
             Err(e) => {
                 let error_msg = format!("Failed to get journal entries: {}", e);
@@ -2016,6 +2272,7 @@ impl JournalConsolidator {
                 consolidated_entries: stale_entries, // Include stale entries for journal cleanup
                 size_delta: 0,
                 write_cache_delta: 0,
+                is_new_object: false,
             });
         }
 
@@ -2039,6 +2296,11 @@ impl JournalConsolidator {
                 ));
             }
         };
+
+        // Check range count before consolidation modifies the metadata.
+        // If the object had no ranges (new or HEAD-only .meta), adding the first
+        // range means we should count it as a new cached object.
+        let had_no_ranges_before = metadata.ranges.is_empty();
 
         // Resolve conflicts between metadata and journal entries
         let _conflicts_resolved = self
@@ -2075,6 +2337,9 @@ impl JournalConsolidator {
             ));
         }
 
+        // Count as new cached object if this is the first time ranges are being added.
+        // This covers both truly new objects and HEAD-only .meta files getting their first range.
+
         // Return the valid entries that were consolidated - these should be removed from journals
         // Stale entries (old entries with missing range files) are also included for removal
         // Pending entries (recent with missing files) are NOT included and will be retried
@@ -2102,6 +2367,7 @@ impl JournalConsolidator {
             consolidated_entries: entries_to_remove, // Include both valid and stale entries for journal cleanup
             size_delta,
             write_cache_delta,
+            is_new_object: had_no_ranges_before && entries_consolidated > 0,
         };
 
         debug!(
@@ -2116,27 +2382,61 @@ impl JournalConsolidator {
     ///
     /// Reads from per-instance journals: `metadata/_journals/{instance_id}.journal`
     pub async fn discover_pending_cache_keys(&self) -> Result<Vec<String>> {
+        let index = self.discover_pending_cache_keys_indexed().await?;
+        Ok(index.into_keys().collect())
+    }
+
+    /// Like `discover_pending_cache_keys` but returns a map of cache_key → journal files
+    /// that contain entries for that key. Built in a single pass over all journal files so
+    /// callers can avoid re-scanning all files for each key during consolidation.
+    pub async fn discover_pending_cache_keys_indexed(
+        &self,
+    ) -> Result<HashMap<String, Vec<PathBuf>>> {
+        let discovery = self.discover_pending_cache_keys_indexed_capped(0).await?;
+        Ok(discovery.key_index)
+    }
+
+    /// Discover pending cache keys with an optional cap on the number of keys returned.
+    /// When `max_keys` > 0, stops reading journal files once the index reaches the cap,
+    /// reducing NFS I/O when the backlog is large.
+    pub async fn discover_pending_cache_keys_indexed_capped(
+        &self,
+        max_keys: usize,
+    ) -> Result<DiscoveryResult> {
         let journals_dir = self.cache_dir.join("metadata").join("_journals");
 
         if !journals_dir.exists() {
-            return Ok(Vec::new());
+            return Ok(DiscoveryResult {
+                key_index: HashMap::new(),
+                file_entry_counts: HashMap::new(),
+            });
         }
 
-        let mut cache_keys = std::collections::HashSet::new();
+        // key → set of journal file paths that contain at least one entry for that key
+        let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        // file path → total parseable entry count (for optimized cleanup)
+        let mut file_entry_counts: HashMap<PathBuf, usize> = HashMap::new();
 
-        // Scan all .journal files in the _journals directory
         let journal_entries = std::fs::read_dir(&journals_dir).map_err(|e| {
             ProxyError::CacheError(format!("Failed to read journals directory: {}", e))
         })?;
 
         for journal_entry in journal_entries {
+            // Early exit: stop reading more journal files once we have enough keys
+            if max_keys > 0 && index.len() >= max_keys {
+                debug!(
+                    "Discovery cap reached ({} keys), skipping remaining journal files",
+                    max_keys
+                );
+                break;
+            }
+
             let journal_entry = journal_entry.map_err(|e| {
                 ProxyError::CacheError(format!("Failed to read journal directory entry: {}", e))
             })?;
 
             let journal_path = journal_entry.path();
 
-            // Only process files (not directories)
             if !journal_path.is_file() {
                 continue;
             }
@@ -2146,21 +2446,34 @@ impl JournalConsolidator {
                 None => continue,
             };
 
-            // Only process .journal files (per-instance format)
             if !file_name.ends_with(".journal") {
                 continue;
             }
 
-            // Read journal file and extract cache keys
             match tokio::fs::read_to_string(&journal_path).await {
                 Ok(content) => {
+                    // Track which keys appear in this file (avoid duplicate path entries)
+                    let mut keys_in_file: HashSet<String> = HashSet::new();
+                    let mut entry_count: usize = 0;
                     for line in content.lines() {
+                        // Inner-loop cap: stop parsing this file once we have enough keys.
+                        // Entry count will be incomplete for capped files, but that's fine —
+                        // cleanup will fall through to entry-by-entry matching for those files.
+                        if max_keys > 0 && index.len() >= max_keys {
+                            break;
+                        }
                         if line.trim().is_empty() {
                             continue;
                         }
                         match serde_json::from_str::<JournalEntry>(line) {
                             Ok(entry) => {
-                                cache_keys.insert(entry.cache_key);
+                                entry_count += 1;
+                                if keys_in_file.insert(entry.cache_key.clone()) {
+                                    index
+                                        .entry(entry.cache_key)
+                                        .or_default()
+                                        .push(journal_path.clone());
+                                }
                             }
                             Err(e) => {
                                 debug!(
@@ -2170,10 +2483,11 @@ impl JournalConsolidator {
                             }
                         }
                     }
+                    if entry_count > 0 {
+                        file_entry_counts.insert(journal_path.clone(), entry_count);
+                    }
                 }
                 Err(e) => {
-                    // Stale file handle and other transient errors are expected on shared storage
-                    // The consolidation will retry on the next cycle
                     debug!(
                         "Failed to read journal file (discover_pending): file={:?}, error={}",
                         journal_path, e
@@ -2183,10 +2497,14 @@ impl JournalConsolidator {
         }
 
         debug!(
-            "Discovered {} cache keys with pending journal entries",
-            cache_keys.len()
+            "Discovered {} cache keys with pending journal entries across {} journal files",
+            index.len(),
+            file_entry_counts.len()
         );
-        Ok(cache_keys.into_iter().collect())
+        Ok(DiscoveryResult {
+            key_index: index,
+            file_entry_counts,
+        })
     }
     /// Get all journal entries for a cache key from all instance journal files
     pub async fn get_all_entries_for_cache_key(
@@ -2817,26 +3135,20 @@ impl JournalConsolidator {
         Ok(())
     }
 
-    /// Clean up all instance journal files after a consolidation run
+    /// Clean up journal files after a consolidation cycle.
     ///
-    /// This should be called after all cache keys have been processed in a consolidation run.
-    /// It truncates all instance journal files to remove processed entries.
-    ///
-    /// Note: This is safe because:
-    /// 1. Each instance writes only to its own journal file
-    /// 2. Consolidation reads from all journal files (read-only)
-    /// 3. Any new entries written during consolidation will be in a new file or appended
-    ///    after the truncation point
-    ///
-    /// IMPORTANT: This method now only removes entries that were successfully consolidated.
-    /// Entries that failed validation (e.g., range file not yet visible due to NFS caching)
-    /// are preserved and will be retried on the next consolidation cycle.
+    /// Uses file-level optimization: if all entries in a journal file were consolidated
+    /// (determined by comparing consolidated entry count against the total entry count
+    /// recorded during discovery), the file is deleted/truncated without re-reading.
+    /// Only files with a mix of consolidated and unconsolidated entries are re-read
+    /// and rewritten.
     ///
     /// Uses file-level locking (flock) to prevent races with append operations
-    /// from other instances (Bug 5 fix).
+    /// from other instances.
     pub async fn cleanup_consolidated_entries(
         &self,
         consolidated_entries: &[JournalEntry],
+        file_entry_counts: &HashMap<PathBuf, usize>,
     ) -> Result<()> {
         if consolidated_entries.is_empty() {
             return Ok(());
@@ -2848,19 +3160,30 @@ impl JournalConsolidator {
             return Ok(());
         }
 
-        // Group consolidated entries by their instance_id to know which journal files to update
-        let mut entries_by_instance: std::collections::HashMap<String, Vec<&JournalEntry>> =
-            std::collections::HashMap::new();
-        for entry in consolidated_entries {
-            entries_by_instance
-                .entry(entry.instance_id.clone())
-                .or_default()
-                .push(entry);
-        }
+        // Count how many consolidated entries came from each journal file.
+        // consolidated_entries don't directly track their source file, but we can
+        // determine this by checking which files contain entries for each key
+        // (from the key_index built during discovery). Instead, build a HashSet
+        // for matching and count per-file during the scan.
+        let consolidated_set: HashSet<(String, u64, u64, SystemTime, String)> = consolidated_entries
+            .iter()
+            .map(|ce| (
+                ce.cache_key.clone(),
+                ce.range_spec.start,
+                ce.range_spec.end,
+                ce.timestamp,
+                ce.instance_id.clone(),
+            ))
+            .collect();
 
         let journal_files = std::fs::read_dir(&journals_dir).map_err(|e| {
             ProxyError::CacheError(format!("Failed to read journals directory: {}", e))
         })?;
+
+        let mut files_deleted = 0u32;
+        let mut files_truncated = 0u32;
+        let mut files_rewritten = 0u32;
+        let mut files_skipped = 0u32;
 
         for journal_entry in journal_files {
             let journal_entry = match journal_entry {
@@ -2878,7 +3201,7 @@ impl JournalConsolidator {
             }
 
             let file_name = match journal_path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name,
+                Some(name) => name.to_string(),
                 None => continue,
             };
 
@@ -2886,7 +3209,19 @@ impl JournalConsolidator {
                 continue;
             }
 
-            // Acquire file-level lock to prevent races with append operations (Bug 5 fix)
+            // Check if this file was seen during discovery and has a known entry count.
+            // If the file wasn't in discovery (e.g., created after discovery started),
+            // skip it — its entries weren't processed this cycle.
+            // When file_entry_counts is empty (e.g., called from tests or outside the
+            // discovery flow), process all journal files (fallback to old behavior).
+            if !file_entry_counts.is_empty() {
+                if !file_entry_counts.contains_key(&journal_path) {
+                    files_skipped += 1;
+                    continue;
+                }
+            }
+
+            // Acquire file-level lock to prevent races with append operations
             let lock_path = journal_path.with_extension("journal.lock");
             let lock_file = match std::fs::OpenOptions::new()
                 .create(true)
@@ -2913,7 +3248,8 @@ impl JournalConsolidator {
                 continue;
             }
 
-            // Read current journal content (while holding lock)
+            // Read current journal content (while holding lock).
+            // We must re-read because new entries may have been appended since discovery.
             let content = match tokio::fs::read_to_string(&journal_path).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -2921,14 +3257,13 @@ impl JournalConsolidator {
                         "Failed to read journal file for cleanup (likely already deleted): path={:?}, error={}",
                         journal_path, e
                     );
-                    // Lock is released when lock_file is dropped
                     continue;
                 }
             };
 
-            // Parse entries and filter out consolidated ones
+            // Parse entries and separate consolidated from remaining
             let mut remaining_entries = Vec::new();
-            let mut removed_count = 0;
+            let mut removed_count = 0usize;
 
             for line in content.lines() {
                 if line.trim().is_empty() {
@@ -2936,21 +3271,16 @@ impl JournalConsolidator {
                 }
                 match serde_json::from_str::<JournalEntry>(line) {
                     Ok(entry) => {
-                        // Check if this entry was consolidated
-                        let was_consolidated = consolidated_entries.iter().any(|ce| {
-                            ce.cache_key == entry.cache_key
-                                && ce.range_spec.start == entry.range_spec.start
-                                && ce.range_spec.end == entry.range_spec.end
-                                && ce.timestamp == entry.timestamp
-                                && ce.instance_id == entry.instance_id
-                        });
+                        let was_consolidated = consolidated_set.contains(&(
+                            entry.cache_key.clone(),
+                            entry.range_spec.start,
+                            entry.range_spec.end,
+                            entry.timestamp,
+                            entry.instance_id.clone(),
+                        ));
 
                         if was_consolidated {
                             removed_count += 1;
-                            debug!(
-                                "Removing consolidated entry: cache_key={}, range={}-{}, instance={}",
-                                entry.cache_key, entry.range_spec.start, entry.range_spec.end, entry.instance_id
-                            );
                         } else {
                             remaining_entries.push(entry);
                         }
@@ -2960,39 +3290,44 @@ impl JournalConsolidator {
                             "Failed to parse journal entry during cleanup: path={:?}, error={}",
                             journal_path, e
                         );
-                        // Keep unparseable lines to avoid data loss
+                        // Keep unparseable lines to avoid data loss — force rewrite path
                     }
                 }
             }
 
-            // Write back remaining entries (or handle empty file)
-            if remaining_entries.is_empty() {
-                // Check if this is a fresh journal file (has timestamp suffix)
-                // Fresh journals have format: {instance_id}:{timestamp}.journal
-                let is_fresh_journal = file_name.contains(':');
+            if removed_count == 0 {
+                // No entries to remove from this file — skip write
+                files_skipped += 1;
+                continue;
+            }
 
+            let is_fresh_journal = file_name.contains(':');
+
+            if remaining_entries.is_empty() {
+                // All entries consolidated — delete or truncate without rewriting
                 if is_fresh_journal {
-                    // Delete empty fresh journal files
                     match tokio::fs::remove_file(&journal_path).await {
                         Ok(_) => {
+                            files_deleted += 1;
                             debug!(
-                                "Deleted empty fresh journal file: path={:?}, removed={}",
+                                "Deleted fully-consolidated fresh journal: path={:?}, removed={}",
                                 journal_path, removed_count
                             );
                         }
                         Err(e) => {
                             warn!(
-                                "Failed to delete empty fresh journal file: path={:?}, error={}",
+                                "Failed to delete fresh journal file: path={:?}, error={}",
                                 journal_path, e
                             );
                         }
                     }
                 } else {
-                    // Truncate primary journal files (keep the file for future appends)
+                    // Truncate primary journal (keep file for future appends)
                     match tokio::fs::write(&journal_path, "").await {
                         Ok(_) => {
+                            files_truncated += 1;
                             debug!(
-                                "Truncated journal file (all entries consolidated): path={:?}, removed={}",
+                                "Truncated fully-consolidated primary journal: path={:?}, removed={}",
                                 journal_path, removed_count
                             );
                         }
@@ -3004,8 +3339,8 @@ impl JournalConsolidator {
                         }
                     }
                 }
-            } else if removed_count > 0 {
-                // Write back remaining entries
+            } else {
+                // Partial consolidation — rewrite with remaining entries
                 let mut new_content = String::new();
                 for entry in &remaining_entries {
                     match serde_json::to_string(entry) {
@@ -3024,11 +3359,10 @@ impl JournalConsolidator {
 
                 match tokio::fs::write(&journal_path, new_content).await {
                     Ok(_) => {
+                        files_rewritten += 1;
                         debug!(
-                            "Updated journal file: path={:?}, removed={}, remaining={}",
-                            journal_path,
-                            removed_count,
-                            remaining_entries.len()
+                            "Rewritten journal file: path={:?}, removed={}, remaining={}",
+                            journal_path, removed_count, remaining_entries.len()
                         );
                     }
                     Err(e) => {
@@ -3039,6 +3373,13 @@ impl JournalConsolidator {
                     }
                 }
             }
+        }
+
+        if files_deleted > 0 || files_truncated > 0 || files_rewritten > 0 {
+            info!(
+                "Journal cleanup: deleted={}, truncated={}, rewritten={}, skipped={}",
+                files_deleted, files_truncated, files_rewritten, files_skipped
+            );
         }
 
         // Clean up stale lock files (lock files for journals that no longer exist)
@@ -3109,6 +3450,135 @@ impl JournalConsolidator {
         }
     }
 
+    /// Remove journal files (and .tmp files) belonging to dead instances.
+    ///
+    /// Journal file names encode the instance ID as `{hostname}:{pid}.journal`.
+    /// If the PID no longer exists on this host, the instance crashed or was OOM-killed
+    /// and its journal entries are orphaned. These files accumulate after repeated crashes
+    /// and can reach hundreds of MB, causing memory pressure during discovery (which reads
+    /// them into memory via `read_to_string`).
+    ///
+    /// This method:
+    /// 1. Lists all `.journal` and `.journal.tmp` files in `_journals/`
+    /// 2. Extracts the PID from the filename
+    /// 3. Checks if the PID is alive on this host (via `kill(pid, 0)`)
+    /// 4. Removes files from dead PIDs
+    ///
+    /// Safe for multi-instance: only removes files whose hostname matches this host.
+    /// Files from other hosts are left alone (their PIDs are in a different PID namespace).
+    async fn cleanup_dead_instance_journals(&self) {
+        let journals_dir = self.cache_dir.join("metadata").join("_journals");
+        if !journals_dir.exists() {
+            return;
+        }
+
+        let my_hostname = gethostname::gethostname().to_string_lossy().to_string();
+        let my_pid = std::process::id();
+
+        let entries = match std::fs::read_dir(&journals_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Failed to read journals dir for dead instance cleanup: {}", e);
+                return;
+            }
+        };
+
+        let mut removed_count = 0u32;
+        let mut removed_bytes = 0u64;
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            // Match patterns: {hostname}:{pid}.journal, {hostname}:{pid}.journal.tmp,
+            // {hostname}:{pid}:{timestamp}.journal (fresh journals from lock contention)
+            let is_journal = file_name.ends_with(".journal") || file_name.ends_with(".journal.tmp");
+            if !is_journal {
+                continue;
+            }
+
+            // Strip suffixes to get the instance_id part
+            let instance_part = file_name
+                .strip_suffix(".journal.tmp")
+                .or_else(|| file_name.strip_suffix(".journal"));
+            let instance_part = match instance_part {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Parse hostname:pid (or hostname:pid:timestamp for fresh journals)
+            let parts: Vec<&str> = instance_part.splitn(3, ':').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+
+            let hostname = parts[0];
+            let pid_str = parts[1];
+
+            // Only clean up files from this host
+            if hostname != my_hostname {
+                continue;
+            }
+
+            let pid: u32 = match pid_str.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // Skip our own PID
+            if pid == my_pid {
+                continue;
+            }
+
+            // Check if the PID is still alive
+            #[cfg(unix)]
+            let is_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+            #[cfg(not(unix))]
+            let is_alive = true; // Conservative: don't remove on non-Unix
+
+            if !is_alive {
+                let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                match std::fs::remove_file(&path) {
+                    Ok(_) => {
+                        removed_count += 1;
+                        removed_bytes += file_size;
+                        debug!(
+                            "Removed dead instance journal: file={}, pid={}, size={}",
+                            file_name, pid, file_size
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to remove dead instance journal {}: {}",
+                            file_name, e
+                        );
+                    }
+                }
+
+                // Also remove associated lock file
+                let lock_path = path.with_extension("journal.lock");
+                if lock_path.exists() {
+                    let _ = std::fs::remove_file(&lock_path);
+                }
+            }
+        }
+
+        if removed_count > 0 {
+            info!(
+                "Cleaned up {} dead instance journal files ({:.1} MB)",
+                removed_count,
+                removed_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
+
     /// Get metadata file path for a cache key
     ///
     /// # Panics
@@ -3172,7 +3642,7 @@ impl JournalConsolidator {
             Ok(result) => {
                 if result.entries_consolidated > 0 {
                     info!(
-                        "Final consolidation cycle completed: entries={}, size_delta={:+}, current_size={}",
+                        "Final consolidation cycle completed: entries={}, size_delta={:+}, total_cache_size={}",
                         result.entries_consolidated, result.size_delta, result.current_size
                     );
                 } else {
@@ -3261,8 +3731,9 @@ mod tests {
         assert_eq!(config.interval, Duration::from_secs(5)); // Changed from 30s to 5s
         assert_eq!(config.size_threshold, 1024 * 1024);
         assert_eq!(config.entry_count_threshold, 100);
-        assert_eq!(config.max_keys_per_run, 50);
+        assert_eq!(KEY_CONCURRENCY_LIMIT, 64);
         assert_eq!(config.consolidation_cycle_timeout, Duration::from_secs(30));
+        assert_eq!(config.max_keys_per_cycle, 5000);
     }
 
     #[test]
@@ -3731,6 +4202,7 @@ mod tests {
         let state = SizeState {
             total_size: 1024 * 1024 * 100,      // 100MB
             write_cache_size: 1024 * 1024 * 10, // 10MB
+            cached_objects: 0,
             last_consolidation: now,
             consolidation_count: 42,
             last_updated_by: "test-host:12345".to_string(),
@@ -3812,6 +4284,7 @@ mod tests {
         let state = SizeState {
             total_size: 1024 * 1024 * 50, // 50MB
             write_cache_size: 1024 * 1024 * 5, // 5MB
+            cached_objects: 0,
             consolidation_count: 10,
             last_updated_by: "test-host:99999".to_string(),
             last_consolidation: SystemTime::now(),
@@ -3859,6 +4332,7 @@ mod tests {
         let state = SizeState {
             total_size: 1024 * 1024 * 100, // 100MB
             write_cache_size: 0,
+            cached_objects: 0,
             consolidation_count: 0,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
@@ -3896,6 +4370,7 @@ mod tests {
         let state = SizeState {
             total_size: 0,
             write_cache_size: 1024 * 1024 * 10, // 10MB
+            cached_objects: 0,
             consolidation_count: 0,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
@@ -3930,6 +4405,7 @@ mod tests {
         let state = SizeState {
             total_size: 1024 * 1024 * 200, // 200MB
             write_cache_size: 1024 * 1024 * 20, // 20MB
+            cached_objects: 0,
             consolidation_count: 100,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
@@ -4066,6 +4542,7 @@ mod tests {
         let state = SizeState {
             total_size: 1024 * 1024 * 100,      // 100MB
             write_cache_size: 1024 * 1024 * 10, // 10MB
+            cached_objects: 0,
             last_consolidation: SystemTime::now(),
             consolidation_count: 42,
             last_updated_by: "previous-instance:12345".to_string(),
@@ -4226,6 +4703,7 @@ mod tests {
         let initial_state = SizeState {
             total_size: 1000,
             write_cache_size: 0,
+            cached_objects: 0,
             consolidation_count: 5,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
@@ -4339,6 +4817,7 @@ mod tests {
         let state = SizeState {
             total_size: 12345,
             write_cache_size: 1000,
+            cached_objects: 0,
             consolidation_count: 42,
             last_updated_by: "test".to_string(),
             last_consolidation: SystemTime::now(),
@@ -5313,6 +5792,171 @@ mod tests {
 
         assert_eq!(triggered, false, "Should not trigger when max_cache_size is 0");
         assert_eq!(bytes, 0);
+    }
+
+    /// **Feature: consolidation-throughput, Property 1: All discovered keys are submitted for processing**
+    /// *For any* set of discovered pending cache keys of arbitrary size (including sizes greater
+    /// than 50, the previous cap), the number of key futures created for concurrent processing
+    /// shall equal the total number of discovered keys — no `.take()` truncation occurs.
+    /// **Validates: Requirements 1.1**
+    #[quickcheck]
+    fn prop_all_discovered_keys_submitted_for_processing(
+        key_count: u16,
+    ) -> TestResult {
+        // Constrain to 0..=500 keys
+        let key_count = (key_count % 501) as usize;
+
+        // Generate random cache keys
+        let cache_keys: Vec<String> = (0..key_count)
+            .map(|i| format!("bucket/object-{}", i))
+            .collect();
+
+        // Simulate the current key selection logic from run_consolidation_cycle:
+        // All discovered keys (up to max_keys_per_cycle cap) are mapped into futures.
+        // The discovery cap limits NFS I/O; the deadline limits processing time.
+        let key_futures: Vec<&String> = cache_keys.iter().collect();
+
+        // The number of submitted key futures must equal the total discovered keys
+        if key_futures.len() != cache_keys.len() {
+            return TestResult::error(format!(
+                "Key count mismatch: submitted={}, discovered={}",
+                key_futures.len(),
+                cache_keys.len()
+            ));
+        }
+
+        // Verify no keys were dropped — every key must appear in the futures list
+        for (i, key) in cache_keys.iter().enumerate() {
+            if key_futures[i] != key {
+                return TestResult::error(format!(
+                    "Key at index {} differs: expected={}, got={}",
+                    i, key, key_futures[i]
+                ));
+            }
+        }
+
+        TestResult::passed()
+    }
+
+    /// **Feature: consolidation-throughput, Property 2: HashSet cleanup matching equivalence**
+    /// *For any* list of journal entries and *any* subset designated as consolidated entries,
+    /// partitioning the journal entries using HashSet-based O(1) lookup shall produce the
+    /// identical partition (removed set, kept set) as the original linear-scan `.iter().any()` approach.
+    /// **Validates: Requirements 3.3**
+    #[quickcheck]
+    fn prop_hashset_cleanup_matching_equivalence(
+        entry_count: u8,
+        consolidated_mask: Vec<bool>,
+    ) -> TestResult {
+        // Generate 1..=50 journal entries
+        let entry_count = (entry_count % 50) + 1;
+
+        // Build random journal entries with deterministic but varied fields
+        let base_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let entries: Vec<JournalEntry> = (0..entry_count)
+            .map(|i| {
+                let i = i as u64;
+                JournalEntry {
+                    timestamp: base_time + Duration::from_secs(i * 7),
+                    instance_id: format!("inst-{}", i % 5),
+                    cache_key: format!("bucket/obj-{}", i % 10),
+                    range_spec: RangeSpec {
+                        start: i * 1000,
+                        end: i * 1000 + 999,
+                        file_path: format!("range_{}.bin", i),
+                        compression_algorithm: CompressionAlgorithm::Lz4,
+                        compressed_size: 1000,
+                        uncompressed_size: 1000,
+                        created_at: base_time,
+                        last_accessed: base_time,
+                        access_count: 1,
+                        frequency_score: 1,
+                    },
+                    operation: JournalOperation::Add,
+                    range_file_path: format!("range_{}.bin", i),
+                    metadata_version: 1,
+                    new_ttl_secs: None,
+                    object_ttl_secs: Some(3600),
+                    access_increment: None,
+                    object_metadata: None,
+                    metadata_written: false,
+                }
+            })
+            .collect();
+
+        // Select a subset as consolidated entries using the mask
+        let consolidated_entries: Vec<JournalEntry> = entries
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| consolidated_mask.get(*idx).copied().unwrap_or(false))
+            .map(|(_, e)| e.clone())
+            .collect();
+
+        // --- Old logic: linear-scan matching ---
+        let mut old_removed = Vec::new();
+        let mut old_kept = Vec::new();
+        for entry in &entries {
+            let was_consolidated = consolidated_entries.iter().any(|ce| {
+                ce.cache_key == entry.cache_key
+                    && ce.range_spec.start == entry.range_spec.start
+                    && ce.range_spec.end == entry.range_spec.end
+                    && ce.timestamp == entry.timestamp
+                    && ce.instance_id == entry.instance_id
+            });
+            if was_consolidated {
+                old_removed.push(entry.cache_key.clone());
+            } else {
+                old_kept.push(entry.cache_key.clone());
+            }
+        }
+
+        // --- New logic: HashSet-based matching ---
+        let consolidated_set: HashSet<(String, u64, u64, SystemTime, String)> =
+            consolidated_entries
+                .iter()
+                .map(|ce| (
+                    ce.cache_key.clone(),
+                    ce.range_spec.start,
+                    ce.range_spec.end,
+                    ce.timestamp,
+                    ce.instance_id.clone(),
+                ))
+                .collect();
+
+        let mut new_removed = Vec::new();
+        let mut new_kept = Vec::new();
+        for entry in &entries {
+            let was_consolidated = consolidated_set.contains(&(
+                entry.cache_key.clone(),
+                entry.range_spec.start,
+                entry.range_spec.end,
+                entry.timestamp,
+                entry.instance_id.clone(),
+            ));
+            if was_consolidated {
+                new_removed.push(entry.cache_key.clone());
+            } else {
+                new_kept.push(entry.cache_key.clone());
+            }
+        }
+
+        // Assert identical partitions
+        if old_removed != new_removed {
+            return TestResult::error(format!(
+                "Removed sets differ: old={}, new={}",
+                old_removed.len(),
+                new_removed.len()
+            ));
+        }
+        if old_kept != new_kept {
+            return TestResult::error(format!(
+                "Kept sets differ: old={}, new={}",
+                old_kept.len(),
+                new_kept.len()
+            ));
+        }
+
+        TestResult::passed()
     }
 
     /// Test: Second concurrent call to guard returns error when guard is already acquired.

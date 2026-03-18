@@ -296,7 +296,7 @@ async fn test_consolidation_cleanup_on_success() {
 
     // Clean up ONLY the consolidated entries (not all entries)
     consolidator
-        .cleanup_consolidated_entries(&result.consolidated_entries)
+        .cleanup_consolidated_entries(&result.consolidated_entries, &std::collections::HashMap::new())
         .await
         .unwrap();
 
@@ -418,7 +418,7 @@ async fn test_consolidation_preserves_entries_with_missing_range_files() {
 
     // Clean up ONLY the consolidated entries
     consolidator
-        .cleanup_consolidated_entries(&result.consolidated_entries)
+        .cleanup_consolidated_entries(&result.consolidated_entries, &std::collections::HashMap::new())
         .await
         .unwrap();
 

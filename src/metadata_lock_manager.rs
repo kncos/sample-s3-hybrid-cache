@@ -407,6 +407,25 @@ impl MetadataLockManager {
         unreachable!("Loop should have returned or errored")
     }
 
+    /// Try to acquire a metadata lock with a single attempt (no retries).
+    ///
+    /// Returns `Ok(lock)` if acquired, `Err` if the lock is held by another process.
+    /// Still checks for stale locks and breaks them if found, but does not retry
+    /// with exponential backoff. Used by journal consolidation where skipping a
+    /// contended key and retrying next cycle is cheaper than waiting.
+    pub async fn try_acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
+        let lock_file_path = self.get_lock_file_path(cache_key);
+
+        // Ensure parent directory exists
+        if let Some(parent) = lock_file_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ProxyError::CacheError(format!("Failed to create lock directory: {}", e))
+            })?;
+        }
+
+        self.try_acquire_lock_once(cache_key, &lock_file_path).await
+    }
+
     /// Try to acquire lock once (internal method)
     async fn try_acquire_lock_once(
         &self,

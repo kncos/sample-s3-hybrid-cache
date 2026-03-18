@@ -1137,12 +1137,20 @@ function renderCacheStats(data) {
             <div class="stat-card">
                 <h3>Overall Statistics</h3>
                 <div class="stat-item">
+                    <span title="Number of distinct objects (unique S3 keys) currently stored on disk.">Total Cached Objects:</span>
+                    <span class="stat-value">${data.disk_cache?.cached_objects != null ? formatNumber(data.disk_cache.cached_objects) : 'N/A'}</span>
+                </div>
+                <div class="stat-item">
                     <span title="Total GET and HEAD cache lookups (read cache requests + metadata cache requests).">Cache Requests (GET + HEAD):</span>
                     <span class="stat-value">${formatNumber((data.overall?.total_requests || 0) + (data.metadata_cache?.hits || 0) + (data.metadata_cache?.misses || 0))}</span>
                 </div>
                 <div class="stat-item">
                     <span title="Total bytes served from cache instead of fetching from S3.">S3 Transfer Saved:</span>
                     <span class="stat-value">${data.overall?.s3_transfer_saved_human || '0 B'}</span>
+                </div>
+                <div class="stat-item">
+                    <span title="Number of S3 requests avoided by serving from cache (GET + HEAD cache hits).">S3 Requests Saved:</span>
+                    <span class="stat-value">${formatNumber(data.overall?.s3_requests_saved || 0)}</span>
                 </div>
                 <div class="stat-item">
                     <span title="Time since the proxy process started.">Uptime:</span>
@@ -1592,18 +1600,18 @@ impl ApiHandler {
                 0.0
             };
 
-            // Get last consolidation timestamp from consolidator if available
-            let last_consolidation =
+            // Get last consolidation timestamp and cached_objects count from consolidator if available
+            let (last_consolidation, disk_cached_objects) =
                 if let Some(consolidator) = cache_manager.get_journal_consolidator().await {
                     let size_state = consolidator.get_size_state().await;
-                    // Only include if consolidation has actually run (not UNIX_EPOCH)
-                    if size_state.last_consolidation > std::time::UNIX_EPOCH {
+                    let last_consol = if size_state.last_consolidation > std::time::UNIX_EPOCH {
                         Some(size_state.last_consolidation)
                     } else {
                         None
-                    }
+                    };
+                    (last_consol, Some(size_state.cached_objects))
                 } else {
-                    None
+                    (None, None)
                 };
 
             CacheStatsResponse {
@@ -1627,6 +1635,7 @@ impl ApiHandler {
                         None
                     },
                     evictions: ram_evictions,
+                    cached_objects: None,
                 },
                 metadata_cache: MetadataCacheStats {
                     hit_rate: if metadata_stats.hits + metadata_stats.misses > 0 {
@@ -1668,6 +1677,7 @@ impl ApiHandler {
                         None
                     },
                     evictions: cache_stats.evicted_entries,
+                    cached_objects: disk_cached_objects,
                 },
                 write_cache: WriteCacheStats {
                     size_bytes: write_cache_size,
@@ -1682,6 +1692,7 @@ impl ApiHandler {
                     uptime_seconds,
                     s3_transfer_saved_bytes: cache_stats.bytes_served_from_cache,
                     s3_transfer_saved_human: format_bytes(cache_stats.bytes_served_from_cache),
+                    s3_requests_saved: cache_stats.cache_hits,
                 },
                 last_consolidation,
             }
@@ -2304,6 +2315,8 @@ pub struct CacheStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_size_human: Option<String>,
     pub evictions: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_objects: Option<u64>,
 }
 
 /// Overall system statistics
@@ -2313,6 +2326,7 @@ pub struct OverallStats {
     pub uptime_seconds: u64,
     pub s3_transfer_saved_bytes: u64,
     pub s3_transfer_saved_human: String,
+    pub s3_requests_saved: u64,
 }
 
 /// System information response structure

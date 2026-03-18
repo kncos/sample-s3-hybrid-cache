@@ -9,6 +9,7 @@ use crate::cache_types::NewCacheMetadata;
 use crate::cache_validator::CacheValidator;
 use crate::config::CacheConfig;
 use crate::error::{ProxyError, Result};
+use crate::journal_consolidator::SizeState;
 use crate::write_cache_manager::WriteCacheManager;
 use fs2::FileExt;
 use serde_json;
@@ -183,6 +184,20 @@ impl CacheInitializationCoordinator {
             success: subsystem_result.is_ok(),
             error_message: subsystem_result.err().map(|e| e.to_string()),
         });
+
+        // On cold startup (real scan was performed), reconcile size_state.json
+        // so eviction decisions use accurate size immediately.
+        if !scan_summary.loaded_from_state_files {
+            if let Some(tracker) = size_tracker.as_ref() {
+                tracker
+                    .update_size_from_scan(
+                        scan_summary.total_size,
+                        scan_summary.write_cached_size,
+                        scan_summary.total_objects,
+                    )
+                    .await;
+            }
+        }
 
         // Phase 4: Cross-Validation (if both subsystems available)
         let phase4_start = Instant::now();
@@ -484,6 +499,46 @@ impl CacheInitializationCoordinator {
     /// validation as required by the atomic metadata writes specification.
     ///
     /// # Requirements
+    /// Load scan results from size_state.json instead of walking all .meta files.
+    /// Used on warm startup when validation is fresh (<23h).
+    async fn load_scan_results_from_size_state(
+        &self,
+        performance_metrics: &mut PerformanceMetrics,
+    ) -> ObjectsScanResults {
+        let size_state_path = self.cache_dir.join("size_tracking").join("size_state.json");
+
+        let state: SizeState = match tokio::fs::read_to_string(&size_state_path).await {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => SizeState::default(),
+        };
+
+        let read_cached_size = state.total_size.saturating_sub(state.write_cache_size);
+
+        info!(
+            "Cache initialization: Skipping scan (validation fresh) - \
+             loaded from size_state.json: total={}, write_cache={}, objects={}",
+            format_bytes_human(state.total_size),
+            format_bytes_human(state.write_cache_size),
+            state.cached_objects,
+        );
+
+        performance_metrics.scan_duration = Duration::ZERO;
+        performance_metrics.files_processed = 0;
+
+        ObjectsScanResults {
+            total_objects: state.cached_objects,
+            total_size: state.total_size,
+            write_cached_objects: 0,
+            write_cached_size: state.write_cache_size,
+            read_cached_objects: state.cached_objects,
+            read_cached_size,
+            metadata_entries: vec![],
+            scan_duration: Duration::ZERO,
+            scan_errors: vec![],
+            loaded_from_state_files: true,
+        }
+    }
+
     /// - Requirement 10.1: Integrate metadata consistency validation into Phase 2
     /// - Requirement 10.2: Check validation freshness (23-hour validity)
     /// - Requirement 10.3: Skip validation if fresh validation exists
@@ -504,13 +559,13 @@ impl CacheInitializationCoordinator {
             Ok(freshness_info) => {
                 if freshness_info.is_fresh {
                     info!(
-                        "Cache initialization: Validation is fresh ({}), skipping comprehensive consistency validation",
+                        "Cache initialization: Validation is fresh ({}), skipping metadata scan",
                         freshness_info.message
                     );
-                    // Perform regular scan without comprehensive validation
-                    return self
-                        .scan_cache_metadata_with_metrics(performance_metrics)
-                        .await;
+                    // Load from size_state.json instead of walking all .meta files
+                    return Ok(self
+                        .load_scan_results_from_size_state(performance_metrics)
+                        .await);
                 } else {
                     info!(
                         "Cache initialization: Validation is stale ({}), performing comprehensive consistency validation",
@@ -570,6 +625,13 @@ impl CacheInitializationCoordinator {
                             crate::cache_initialization_coordinator::ScanErrorCategory::Validation,
                         ));
                     }
+                }
+
+                if consistency_info.head_only_expired_removed > 0 {
+                    info!(
+                        "Cache initialization: Removed {} stale HEAD-only metadata entries (expired >1 day, no cached object data)",
+                        consistency_info.head_only_expired_removed
+                    );
                 }
 
                 // Update validation timestamp to mark this validation as complete
@@ -742,6 +804,9 @@ impl CacheInitializationCoordinator {
         let mut corruption_count = 0;
         let mut errors = Vec::new();
         let mut validated_count = 0;
+        let mut head_only_expired_removed = 0;
+        let now = std::time::SystemTime::now();
+        let one_day = std::time::Duration::from_secs(24 * 3600);
 
         // Create cache validator for consistency checks
         let validator = crate::cache_validator::CacheValidator::new(self.cache_dir.clone());
@@ -750,6 +815,73 @@ impl CacheInitializationCoordinator {
         for entry in &scan_results.metadata_entries {
             if let Some(metadata) = &entry.metadata {
                 validated_count += 1;
+
+                // Clean up HEAD-only entries expired for more than 1 day.
+                // These have no cached body data (ranges is empty) and the HEAD
+                // metadata is stale — keeping them wastes disk space and NFS I/O.
+                if metadata.ranges.is_empty() {
+                    if let Some(head_expires) = metadata.head_expires_at {
+                        if let Ok(expired_for) = now.duration_since(head_expires) {
+                            if expired_for > one_day {
+                                // Remove the .meta file
+                                if entry.file_path.exists() {
+                                    match std::fs::remove_file(&entry.file_path) {
+                                        Ok(_) => {
+                                            head_only_expired_removed += 1;
+                                            debug!(
+                                                "Removed stale HEAD-only entry: {} (expired {:.1} days ago)",
+                                                entry.cache_key,
+                                                expired_for.as_secs_f64() / 86400.0
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to remove stale HEAD-only entry {}: {}",
+                                                entry.cache_key, e
+                                            );
+                                        }
+                                    }
+                                }
+                                // Also remove lock file if present
+                                let lock_path = entry.file_path.with_extension("meta.lock");
+                                if lock_path.exists() {
+                                    let _ = std::fs::remove_file(&lock_path);
+                                }
+                                continue; // Skip further validation for removed entry
+                            }
+                        }
+                    } else {
+                        // head_expires_at is None — HEAD was never cached or already cleared.
+                        // If object-level expires_at is also >1 day expired, remove it.
+                        if let Ok(expired_for) = now.duration_since(metadata.expires_at) {
+                            if expired_for > one_day {
+                                if entry.file_path.exists() {
+                                    match std::fs::remove_file(&entry.file_path) {
+                                        Ok(_) => {
+                                            head_only_expired_removed += 1;
+                                            debug!(
+                                                "Removed stale HEAD-only entry (no head_expires_at): {} (object expired {:.1} days ago)",
+                                                entry.cache_key,
+                                                expired_for.as_secs_f64() / 86400.0
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to remove stale HEAD-only entry {}: {}",
+                                                entry.cache_key, e
+                                            );
+                                        }
+                                    }
+                                }
+                                let lock_path = entry.file_path.with_extension("meta.lock");
+                                if lock_path.exists() {
+                                    let _ = std::fs::remove_file(&lock_path);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
 
                 // Perform metadata integrity validation
                 match validator.validate_metadata_integrity(metadata).await {
@@ -803,6 +935,7 @@ impl CacheInitializationCoordinator {
         Ok(ConsistencyValidationInfo {
             validated_count,
             corruption_count,
+            head_only_expired_removed,
             errors,
             validation_duration,
         })
@@ -999,6 +1132,7 @@ impl CacheInitializationCoordinator {
             metadata_entries,
             scan_duration,
             scan_errors,
+            loaded_from_state_files: false,
         };
 
         info!(
@@ -2509,6 +2643,8 @@ pub struct ObjectsScanResults {
     pub scan_duration: Duration,
     /// Errors encountered during scan
     pub scan_errors: Vec<ScanError>,
+    /// Whether results were loaded from size_state.json instead of a real scan
+    pub loaded_from_state_files: bool,
 }
 
 impl ObjectsScanResults {
@@ -2524,6 +2660,7 @@ impl ObjectsScanResults {
             metadata_entries: Vec::new(),
             scan_duration: Duration::ZERO,
             scan_errors: Vec::new(),
+            loaded_from_state_files: false,
         }
     }
 
@@ -3131,6 +3268,8 @@ pub struct ConsistencyValidationInfo {
     pub validated_count: usize,
     /// Number of corrupted metadata entries found
     pub corruption_count: usize,
+    /// Number of HEAD-only expired entries removed
+    pub head_only_expired_removed: usize,
     /// List of validation errors
     pub errors: Vec<String>,
     /// Duration of validation process
@@ -3140,13 +3279,18 @@ pub struct ConsistencyValidationInfo {
 impl ConsistencyValidationInfo {
     /// Get summary string for logging
     pub fn summary_string(&self) -> String {
-        format!(
-            "validated {} entries, found {} corrupted, {} errors in {}",
-            self.validated_count,
-            self.corruption_count,
-            self.errors.len(),
-            format_duration_human(self.validation_duration)
-        )
+        let mut parts = vec![
+            format!("validated {} entries", self.validated_count),
+            format!("found {} corrupted", self.corruption_count),
+            format!("{} errors", self.errors.len()),
+        ];
+        if self.head_only_expired_removed > 0 {
+            parts.push(format!(
+                "removed {} stale HEAD-only entries",
+                self.head_only_expired_removed
+            ));
+        }
+        format!("{} in {}", parts.join(", "), format_duration_human(self.validation_duration))
     }
 }
 
@@ -3473,7 +3617,7 @@ mod tests {
         consolidator.initialize().await.unwrap();
         // Set write cache size to match manager
         consolidator
-            .update_size_from_validation(512, Some(512))
+            .update_size_from_validation(512, Some(512), None)
             .await;
 
         // Create size tracker with consolidator reference
@@ -3556,7 +3700,7 @@ mod tests {
         ));
         consolidator.initialize().await.unwrap();
         consolidator
-            .update_size_from_validation(900, Some(900))
+            .update_size_from_validation(900, Some(900), None)
             .await;
 
         // Create size tracker with consolidator reference
@@ -3640,7 +3784,7 @@ mod tests {
         ));
         consolidator.initialize().await.unwrap();
         consolidator
-            .update_size_from_validation(750, Some(750))
+            .update_size_from_validation(750, Some(750), None)
             .await;
 
         // Create size tracker with consolidator reference

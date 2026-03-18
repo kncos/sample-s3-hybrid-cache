@@ -628,7 +628,7 @@ cache:
     consolidation_cycle_timeout: "30s"  # Default: 30 seconds
 ```
 
-Maximum duration for the per-key processing phase of a consolidation cycle. Prevents one slow NFS operation from blocking the next cycle. Keys not processed due to timeout are retried in the next cycle. Size tracking (accumulator delta collection) runs before per-key processing and is unaffected by this timeout.
+Maximum duration for the consolidation cycle (discovery + per-key processing + cleanup). When the deadline fires, completed keys are preserved and cleaned up; unprocessed keys are retried next cycle. Discovery is capped at 5000 keys per cycle to limit NFS I/O. Size tracking (accumulator delta collection) runs before the deadline starts and is unaffected.
 
 ## Range Request Optimization
 

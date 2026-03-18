@@ -5,6 +5,63 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.5] - 2026-03-17
+
+### Changed
+- **Parallel validation scan**: Replaced sequential `WalkDir` with parallel L1 shard directory traversal using rayon. The previous approach used a single-threaded directory walk feeding into parallel file processing via `par_bridge()`, bottlenecked by sequential NFS `readdir` calls. Now enumerates L1 directories upfront and walks each in parallel, overlapping NFS round-trips across rayon threads. Measured improvement from ~35 min to ~10 min for 691k objects on EFS.
+- **Stale HEAD-only metadata cleanup during daily validation**: During the daily consistency validation scan, HEAD-only `.meta` files (no cached object data) that have been expired for more than 1 day are now automatically removed. These entries have no body data to serve and waste disk space and NFS I/O on every scan.
+- **Consolidation lock: try-lock instead of acquire-with-retry**: Per-key metadata lock acquisition in `consolidate_object_with_files` now uses a single non-blocking attempt (`try_acquire_lock`) instead of exponential backoff with up to 5 retries (`acquire_lock`). If the lock is held by another instance, the key is skipped and retried next cycle. Eliminates ~150ms worst-case backoff per contended key, improving throughput under multi-instance contention.
+- **Journal cleanup: file-level skip optimization**: `cleanup_consolidated_entries` now tracks which journal files were seen during discovery. Files not in the discovery set (e.g., created after discovery started) are skipped entirely without any I/O. Files where no entries were consolidated are also skipped. Only files with consolidated entries are re-read and rewritten. Reduces cleanup I/O from O(total_journal_size) to O(files_with_consolidated_entries).
+- **Discovery tracks per-file entry counts**: `discover_pending_cache_keys_indexed_capped` now counts total parseable entries per journal file during the discovery pass (no extra I/O — piggybacks on the existing read). This metadata is passed to cleanup for file-level optimization decisions.
+
+### Added
+- **Dashboard: S3 Requests Saved counter**: New "S3 Requests Saved" metric in the "Overall Statistics" dashboard section shows the total number of GET and HEAD requests served from cache instead of forwarding to S3. Displayed below the existing "S3 Transfer Saved" (bytes) counter.
+
+### Fixed
+- **OOM kills from discovery reading all journal files past key cap**: The `discover_pending_cache_keys_indexed_capped` change to track per-file entry counts removed the inner-loop `break` when the key cap was reached. Instead of stopping mid-file at 5000 keys, discovery continued parsing and deserializing every JSON line in every journal file to get accurate entry counts. With 840 MB of stale journal files from previous crashes, this allocated hundreds of MB of `JournalEntry` objects per 5-second cycle, causing RSS to grow to 30 GB before OOM kill. Restored the inner-loop `break` — entry counts for partially-read files will be incomplete, but cleanup falls through to entry-by-entry matching for those files. Also added `cleanup_dead_instance_journals()` during `initialize()` to remove journal files from dead PIDs (checked via `kill(pid, 0)`), preventing stale journal accumulation after crashes.
+- **Cached objects counter not incrementing for HEAD-then-consolidate pattern**: The counter only incremented when consolidation created a new `.meta` file. When the HEAD handler created a HEAD-only `.meta` (no ranges) first, consolidation saw the file already existed and skipped the increment. Now checks if the metadata had zero ranges before consolidation and counts adding the first range as a new cached object.
+- **Redundant NFS stat in consolidation**: Removed `metadata_path.exists()` call that preceded `load_or_create_metadata` — the range count is now checked from the already-loaded metadata, eliminating one NFS round-trip per consolidated key.
+
+## [1.9.4] - 2026-03-15
+
+### Fixed
+- **Consolidation "zero progress" under high small-object load**: The 30s cycle deadline previously wrapped `buffer_unordered().collect()`, discarding all completed work when the deadline fired. With 100k+ pending keys, every cycle discovered all keys, processed none before the 30s timeout, and discarded the batch — resulting in zero progress indefinitely. Replaced with incremental `stream.next()` polling against a deadline so completed keys are counted, cleaned up, and logged even when the deadline fires.
+- **Unbounded journal discovery causing NFS I/O waste**: Added `max_keys_per_cycle` (default 5000) cap to discovery. Stops reading journal files once the cap is reached (including mid-file), reducing discovery from O(100k) NFS reads to O(5k). Without this, discovery of 66k+ keys consumed 20s+ of the 30s deadline, leaving only seconds for actual key processing (~192 keys/cycle). With the cap, cycles process up to 5000 discovered keys within the deadline.
+- **Discovery eating into processing deadline**: Moved the 30s deadline to before the discovery phase so the total cycle (discovery + processing + cleanup) is bounded. Previously discovery ran outside the deadline and could consume most of the wall-clock time.
+- **Noisy `trust_dns_proto` warnings**: Suppressed `trust_dns_proto` WARN logs (e.g., "failed to associate send_message response to the sender") by setting the crate to ERROR level. These are benign DNS multiplexing artifacts under high concurrency.
+- **Cached objects counter: NFS contention and batching**: Moved `increment_cached_objects` from per-key (one NFS lock + read + write per new object) to a single batched call after the cycle completes. Reduces NFS lock operations from N to 1 per cycle. The counter still only increments for genuinely new objects (first `.meta` file creation); re-consolidation of existing objects does not double-count.
+- **HEAD handler overwriting consolidated ranges via NFS attribute cache**: `store_head_cache_entry_unified` used `metadata_path.exists()` to decide whether to update or create a `.meta` file. On NFS, `exists()` can return `false` due to attribute caching even when the file was recently written by consolidation on another instance. This caused the HEAD handler to create a HEAD-only `.meta` (empty ranges) that overwrote the consolidated version, losing cached range data. Replaced with a direct `read_from_disk` attempt that bypasses the NFS attribute cache.
+- **MetadataCache caching HEAD-only entries without ranges**: The HEAD handler stored metadata with empty ranges in the MetadataCache (RAM). Any subsequent range lookup hitting that RAM entry within the 5s refresh window would see `ranges=0` and miss, even if the disk `.meta` had been updated by consolidation with range data. Fixed by not caching empty-ranges metadata in RAM — HEAD-only entries are written to disk but not stored in the MetadataCache. Metadata is only cached in RAM once consolidation adds ranges, ensuring range lookups always benefit from the cache.
+
+### Changed
+- **Dashboard**: Moved "Total Cached Objects" from "Disk Cache: Object Ranges" to "Overall Statistics" section.
+- **Log levels**: Downgraded consolidation cycle deadline, S3 request retry, and per-key consolidation failure messages from WARN to INFO — these are expected operational behavior under load, not error conditions. Rate-limited the "Request limit exceeded, returning 429" warning to once per minute to reduce log noise during burst traffic.
+- **Range clamping for oversized range requests**: When a client requests a range larger than the object (e.g., `Range: bytes=0-52428799` for a 10-byte object), S3 returns only the available bytes. The proxy now clamps the cache range end to match the actual data received instead of failing with a validation error.
+- **S3 forward error logging**: Rate-limited "Failed to forward request to S3" errors to once per minute with occurrence count. Added URI and method to the error message for debugging.
+- **Validation metadata**: Fixed `metadata_files_scanned` always reporting 0 in `validation.json`.
+
+## [1.9.3] - 2026-03-12
+
+### Changed
+- **Removed `max_keys_per_run` cap**: The consolidator now processes all discovered pending cache keys each cycle, relying on the 30-second `consolidation_cycle_timeout` as the sole backpressure mechanism. The previous 50-key-per-cycle limit was removed. Note: under very high small-object load (100k+ pending keys), this caused the timeout to fire before any keys completed — addressed in 1.9.4 with discovery capping and incremental streaming.
+- **`KEY_CONCURRENCY_LIMIT` raised from 8 to 64**: Increases parallelism for NFS-latency-bound per-key consolidation, overlapping I/O round-trips for higher throughput.
+- **HashSet cleanup optimization**: `cleanup_consolidated_entries` now uses a `HashSet` for O(1) per-entry matching instead of O(m) linear scan, reducing cleanup from O(n·m) to O(n).
+
+## [1.9.2] - 2026-03-12
+
+### Fixed
+- **Consolidation cycle O(N²) journal scan eliminated**: `discover_pending_cache_keys` now builds a `HashMap<cache_key, Vec<PathBuf>>` index in a single pass over all journal files. Each key's consolidation then reads only the files that contain entries for that key, instead of re-scanning all journal files for every key.
+- **Unused `mut` warning in `initialize()`**: Removed spurious `mut` on `state` binding in the `Ok` arm of `load_size_state()`.
+
+### Changed
+- **Startup scan skip when validation is fresh**: On warm restart (validation ran within 23h), Phase 2 now loads cache size from `size_state.json` instead of walking all `.meta` files on EFS. Eliminates the slow initialization scan on every proxy restart.
+- **Cold startup reconciles size_state.json**: On cold restart (validation stale >23h), the full metadata scan result is written to `size_state.json` via `update_size_from_validation`. Eviction decisions use accurate size immediately rather than waiting for the next daily validation.
+
+## [1.9.1] - 2026-03-11
+
+### Added
+- **Dashboard: Total Cached Objects metric**: New "Total Cached Objects" counter in the "Disk Cache: Object Ranges" dashboard section shows the number of distinct S3 objects (unique cache keys) currently stored on disk. Tracked in `SizeState.cached_objects`, incremented when consolidation writes a new metadata file, decremented when eviction deletes a metadata file, and recalculated from `.meta` file count on startup (upgrade path) and during daily validation scans.
+
 ## [1.9.0] - 2026-03-10
 
 ### Changed
