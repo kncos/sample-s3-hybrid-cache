@@ -77,7 +77,7 @@ dashboard:
 - **Dedicated HTTP server**: Runs on separate port from proxy traffic
 - **Static file handler**: Serves HTML, CSS, JavaScript assets
 - **JSON API handler**: Provides real-time data endpoints
-- **Connection management**: Handles up to 10 concurrent users
+- **Connection management**: Handles up to 50 concurrent users
 
 ### Integration Points
 - **CacheManager**: Real-time cache statistics
@@ -89,7 +89,8 @@ dashboard:
 
 **Static Assets**:
 - `GET /` - Dashboard HTML interface
-- `GET /static/*` - CSS, JavaScript, images
+- `GET /style.css` - Stylesheet
+- `GET /script.js` - JavaScript
 
 **JSON APIs**:
 - `GET /api/cache-stats` - Current cache statistics
@@ -106,7 +107,7 @@ dashboard:
 - **Disk I/O**: Read-only access to logs and cache metadata
 
 ### Scalability
-- **Concurrent users**: Up to 10 simultaneous connections
+- **Concurrent users**: Up to 50 simultaneous connections
 - **Auto-refresh**: Staggered updates to prevent thundering herd
 - **Graceful degradation**: Continues serving under proxy load
 - **Non-blocking**: Does not impact main proxy operations
@@ -160,8 +161,8 @@ services:
 4. Check proxy logs for dashboard-related errors
 
 ### Connection Limits
-- Dashboard supports maximum 10 concurrent connections
-- Additional connections are rejected with HTTP 503
+- Dashboard supports maximum 50 concurrent connections
+- Additional connections are silently dropped when the limit is reached
 - Use browser refresh if connection limit reached
 - Consider increasing refresh intervals to reduce connection frequency
 
