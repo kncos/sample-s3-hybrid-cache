@@ -24,32 +24,38 @@ pub struct OtlpExporter {
 /// One gauge per numeric field in the /metrics JSON response.
 /// Field names use dot-separated JSON paths: `{section}.{field}`.
 struct Instruments {
-    // -- cache --
+    // -- cache: sizes --
     cache_total_cache_size: Gauge<u64>,
     cache_read_cache_size: Gauge<u64>,
     cache_write_cache_size: Gauge<u64>,
     cache_ram_cache_size: Gauge<u64>,
-    cache_hit_rate: Gauge<f64>,
-    cache_ram_hit_rate: Gauge<f64>,
-    cache_total_requests: Gauge<u64>,
+    // -- cache: hits/misses/evictions --
     cache_hits: Gauge<u64>,
     cache_misses: Gauge<u64>,
     cache_evictions: Gauge<u64>,
     cache_write_hits: Gauge<u64>,
+    cache_s3_requests_saved: Gauge<u64>,
+    // -- cache: bytes saved --
+    bytes_served_from_cache: Gauge<u64>,
     // -- cache per-tier: RAM --
     ram_cache_hits: Gauge<u64>,
     ram_cache_misses: Gauge<u64>,
     ram_cache_evictions: Gauge<u64>,
-    ram_cache_max_size: Gauge<u64>,
     // -- cache per-tier: metadata --
     metadata_cache_hits: Gauge<u64>,
     metadata_cache_misses: Gauge<u64>,
     metadata_cache_entries: Gauge<u64>,
-    metadata_cache_max_entries: Gauge<u64>,
     metadata_cache_evictions: Gauge<u64>,
     metadata_cache_stale_refreshes: Gauge<u64>,
-    // -- cache: bytes saved --
-    bytes_served_from_cache: Gauge<u64>,
+    // -- cache: error/health signals --
+    cache_corruption_metadata_total: Gauge<u64>,
+    cache_corruption_missing_range_total: Gauge<u64>,
+    cache_disk_full_events_total: Gauge<u64>,
+    cache_lock_timeout_total: Gauge<u64>,
+    cache_write_failures_total: Gauge<u64>,
+    cache_etag_mismatches_total: Gauge<u64>,
+    cache_range_invalidations_total: Gauge<u64>,
+    cache_incomplete_uploads_evicted: Gauge<u64>,
     // -- compression --
     compression_ratio: Gauge<f64>,
     compression_failures: Gauge<u64>,
@@ -68,9 +74,7 @@ struct Instruments {
     req_successful: Gauge<u64>,
     req_failed: Gauge<u64>,
     req_avg_latency_ms: Gauge<u64>,
-    req_per_second: Gauge<f64>,
     req_active: Gauge<u64>,
-    req_max_concurrent: Gauge<u64>,
     // -- top-level --
     uptime_seconds: Gauge<u64>,
     // -- process --
@@ -122,53 +126,58 @@ impl OtlpExporter {
         macro_rules! g_f64 { ($name:expr) => { m.f64_gauge($name).init() } }
 
         let instruments = Instruments {
+            // cache: sizes
             cache_total_cache_size:  g_u64!("cache.total_cache_size"),
             cache_read_cache_size:   g_u64!("cache.read_cache_size"),
             cache_write_cache_size:  g_u64!("cache.write_cache_size"),
             cache_ram_cache_size:    g_u64!("cache.ram_cache_size"),
-            cache_hit_rate:          g_f64!("cache.cache_hit_rate_percent"),
-            cache_ram_hit_rate:      g_f64!("cache.ram_cache_hit_rate_percent"),
-            cache_total_requests:    g_u64!("cache.total_requests"),
+            // cache: hits/misses/evictions
             cache_hits:              g_u64!("cache.cache_hits"),
             cache_misses:            g_u64!("cache.cache_misses"),
             cache_evictions:         g_u64!("cache.evictions"),
             cache_write_hits:        g_u64!("cache.write_cache_hits"),
-
+            cache_s3_requests_saved: g_u64!("cache.s3_requests_saved"),
+            // cache: bytes saved
+            bytes_served_from_cache: g_u64!("cache.bytes_served_from_cache"),
+            // cache per-tier: RAM
             ram_cache_hits:          g_u64!("cache.ram_cache_hits"),
             ram_cache_misses:        g_u64!("cache.ram_cache_misses"),
             ram_cache_evictions:     g_u64!("cache.ram_cache_evictions"),
-            ram_cache_max_size:      g_u64!("cache.ram_cache_max_size"),
-
-            metadata_cache_hits:           g_u64!("cache.metadata_cache_hits"),
-            metadata_cache_misses:         g_u64!("cache.metadata_cache_misses"),
-            metadata_cache_entries:        g_u64!("cache.metadata_cache_entries"),
-            metadata_cache_max_entries:    g_u64!("cache.metadata_cache_max_entries"),
-            metadata_cache_evictions:      g_u64!("cache.metadata_cache_evictions"),
-            metadata_cache_stale_refreshes:g_u64!("cache.metadata_cache_stale_refreshes"),
-
-            bytes_served_from_cache: g_u64!("cache.bytes_served_from_cache"),
-
+            // cache per-tier: metadata
+            metadata_cache_hits:            g_u64!("cache.metadata_cache_hits"),
+            metadata_cache_misses:          g_u64!("cache.metadata_cache_misses"),
+            metadata_cache_entries:         g_u64!("cache.metadata_cache_entries"),
+            metadata_cache_evictions:       g_u64!("cache.metadata_cache_evictions"),
+            metadata_cache_stale_refreshes: g_u64!("cache.metadata_cache_stale_refreshes"),
+            // cache: error/health signals
+            cache_corruption_metadata_total:       g_u64!("cache.corruption_metadata_total"),
+            cache_corruption_missing_range_total:  g_u64!("cache.corruption_missing_range_total"),
+            cache_disk_full_events_total:          g_u64!("cache.disk_full_events_total"),
+            cache_lock_timeout_total:              g_u64!("cache.lock_timeout_total"),
+            cache_write_failures_total:            g_u64!("cache.write_failures_total"),
+            cache_etag_mismatches_total:           g_u64!("cache.etag_mismatches_total"),
+            cache_range_invalidations_total:       g_u64!("cache.range_invalidations_total"),
+            cache_incomplete_uploads_evicted:      g_u64!("cache.incomplete_uploads_evicted"),
+            // compression
             compression_ratio:       g_f64!("compression.average_compression_ratio"),
             compression_failures:    g_u64!("compression.failures_total"),
-
+            // connection pool
             conn_failed:             g_u64!("connection_pool.failed_connections"),
             conn_latency_ms:         g_u64!("connection_pool.average_latency_ms"),
             conn_success_rate:       g_f64!("connection_pool.success_rate_percent"),
-
-            coalesce_waits:                g_u64!("coalescing.waits_total"),
-            coalesce_cache_hits_after_wait:g_u64!("coalescing.cache_hits_after_wait_total"),
-            coalesce_timeouts:             g_u64!("coalescing.timeouts_total"),
-            coalesce_s3_fetches_saved:     g_u64!("coalescing.s3_fetches_saved_total"),
-            coalesce_avg_wait_ms:          g_f64!("coalescing.average_wait_duration_ms"),
-
+            // coalescing
+            coalesce_waits:                 g_u64!("coalescing.waits_total"),
+            coalesce_cache_hits_after_wait: g_u64!("coalescing.cache_hits_after_wait_total"),
+            coalesce_timeouts:              g_u64!("coalescing.timeouts_total"),
+            coalesce_s3_fetches_saved:      g_u64!("coalescing.s3_fetches_saved_total"),
+            coalesce_avg_wait_ms:           g_f64!("coalescing.average_wait_duration_ms"),
+            // request metrics
             req_total:          g_u64!("request_metrics.total_requests"),
             req_successful:     g_u64!("request_metrics.successful_requests"),
             req_failed:         g_u64!("request_metrics.failed_requests"),
             req_avg_latency_ms: g_u64!("request_metrics.average_response_time_ms"),
-            req_per_second:     g_f64!("request_metrics.requests_per_second"),
             req_active:         g_u64!("request_metrics.active_requests"),
-            req_max_concurrent: g_u64!("request_metrics.max_concurrent_requests"),
-
+            // top-level
             uptime_seconds:      g_u64!("uptime_seconds"),
             memory_usage_bytes:  g_u64!("process.memory_usage_bytes"),
         };
@@ -185,28 +194,37 @@ impl OtlpExporter {
         let a = &[];  // no extra attributes — host/service come from Resource
 
         if let Some(c) = &metrics.cache {
+            // sizes
             i.cache_total_cache_size.record(c.total_cache_size, a);
             i.cache_read_cache_size.record(c.read_cache_size, a);
             i.cache_write_cache_size.record(c.write_cache_size, a);
             i.cache_ram_cache_size.record(c.ram_cache_size, a);
-            i.cache_hit_rate.record(c.cache_hit_rate_percent as f64, a);
-            i.cache_ram_hit_rate.record(c.ram_cache_hit_rate_percent as f64, a);
-            i.cache_total_requests.record(c.total_requests, a);
+            // hits/misses/evictions
             i.cache_hits.record(c.cache_hits, a);
             i.cache_misses.record(c.cache_misses, a);
             i.cache_evictions.record(c.evictions, a);
             i.cache_write_hits.record(c.write_cache_hits, a);
+            i.cache_s3_requests_saved.record(c.cache_hits + c.metadata_cache_hits, a);
+            i.bytes_served_from_cache.record(c.bytes_served_from_cache, a);
+            // RAM tier
             i.ram_cache_hits.record(c.ram_cache_hits, a);
             i.ram_cache_misses.record(c.ram_cache_misses, a);
             i.ram_cache_evictions.record(c.ram_cache_evictions, a);
-            i.ram_cache_max_size.record(c.ram_cache_max_size, a);
+            // metadata tier
             i.metadata_cache_hits.record(c.metadata_cache_hits, a);
             i.metadata_cache_misses.record(c.metadata_cache_misses, a);
             i.metadata_cache_entries.record(c.metadata_cache_entries, a);
-            i.metadata_cache_max_entries.record(c.metadata_cache_max_entries, a);
             i.metadata_cache_evictions.record(c.metadata_cache_evictions, a);
             i.metadata_cache_stale_refreshes.record(c.metadata_cache_stale_refreshes, a);
-            i.bytes_served_from_cache.record(c.bytes_served_from_cache, a);
+            // error/health signals
+            i.cache_corruption_metadata_total.record(c.corruption_metadata_total, a);
+            i.cache_corruption_missing_range_total.record(c.corruption_missing_range_total, a);
+            i.cache_disk_full_events_total.record(c.disk_full_events_total, a);
+            i.cache_lock_timeout_total.record(c.lock_timeout_total, a);
+            i.cache_write_failures_total.record(c.cache_write_failures_total, a);
+            i.cache_etag_mismatches_total.record(c.cache_etag_mismatches_total, a);
+            i.cache_range_invalidations_total.record(c.cache_range_invalidations_total, a);
+            i.cache_incomplete_uploads_evicted.record(c.incomplete_uploads_evicted, a);
         }
 
         if let Some(comp) = &metrics.compression {
@@ -233,9 +251,7 @@ impl OtlpExporter {
         i.req_successful.record(rm.successful_requests, a);
         i.req_failed.record(rm.failed_requests, a);
         i.req_avg_latency_ms.record(rm.average_response_time_ms, a);
-        i.req_per_second.record(rm.requests_per_second as f64, a);
         i.req_active.record(rm.active_requests, a);
-        i.req_max_concurrent.record(rm.max_concurrent_requests, a);
 
         i.uptime_seconds.record(metrics.uptime_seconds, a);
 

@@ -606,11 +606,6 @@ impl BucketSettings {
                     "prefix_overrides[{}]: prefix is empty",
                     i
                 ));
-            } else if !po.prefix.starts_with('/') {
-                errors.push(format!(
-                    "prefix_overrides[{}]: prefix {:?} must start with '/'",
-                    i, po.prefix
-                ));
             }
         }
 
@@ -682,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_prefix_without_leading_slash() {
+    fn validate_accepts_prefix_without_leading_slash() {
         let settings = BucketSettings {
             prefix_overrides: vec![PrefixOverride {
                 prefix: "temp/".to_string(),
@@ -696,10 +691,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let errors = settings.validate();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("must start with '/'"));
-        assert!(errors[0].contains("prefix_overrides[0]"));
+        // Prefixes without leading slash are valid — object keys don't have leading slashes
+        assert!(settings.validate().is_empty());
     }
 
     #[test]
@@ -740,9 +733,10 @@ mod tests {
             ..Default::default()
         };
         let errors = settings.validate();
-        assert_eq!(errors.len(), 2);
+        // Only empty prefix is invalid; no-slash and /valid/ are both acceptable
+        assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("prefix_overrides[0]"));
-        assert!(errors[1].contains("prefix_overrides[2]"));
+        assert!(errors[0].contains("prefix is empty"));
     }
 
     #[test]
@@ -1131,10 +1125,10 @@ mod tests {
         assert_eq!(resolved.get_ttl, Duration::from_secs(20));
         assert_eq!(resolved.head_ttl, Duration::from_secs(5));
 
-        // Step 2: Replace with valid JSON but invalid prefix (no leading slash)
+        // Step 2: Replace with valid JSON but invalid prefix (empty string)
         std::fs::write(
             &settings_path,
-            r#"{"get_ttl": "99s", "prefix_overrides": [{"prefix": "bad-prefix", "get_ttl": "1s"}]}"#,
+            r#"{"get_ttl": "99s", "prefix_overrides": [{"prefix": "", "get_ttl": "1s"}]}"#,
         )
         .unwrap();
         let resolved = mgr.resolve("my-bucket", "/key").await;

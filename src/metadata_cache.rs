@@ -77,9 +77,9 @@ impl MetadataCacheEntry {
 /// Metrics for the metadata cache
 #[derive(Debug, Default)]
 pub struct MetadataCacheMetrics {
-    /// Number of cache hits (found in RAM, not stale)
+    /// Number of cache hits (found in RAM, not stale) — GET path
     pub hits: AtomicU64,
-    /// Number of cache misses (key not in RAM)
+    /// Number of cache misses (key not in RAM) — GET path
     pub misses: AtomicU64,
     /// Number of stale refreshes (re-reads from disk due to staleness)
     pub stale_refreshes: AtomicU64,
@@ -87,8 +87,14 @@ pub struct MetadataCacheMetrics {
     pub evictions: AtomicU64,
     /// Number of stale file handle errors encountered
     pub stale_handle_errors: AtomicU64,
-    /// Number of disk hits (RAM miss but found on disk)
+    /// Number of disk hits (RAM miss but found on disk) — GET path
     pub disk_hits: AtomicU64,
+    /// Number of RAM hits from HEAD requests specifically
+    pub head_hits: AtomicU64,
+    /// Number of RAM misses from HEAD requests specifically
+    pub head_misses: AtomicU64,
+    /// Number of disk hits from HEAD requests specifically
+    pub head_disk_hits: AtomicU64,
 }
 
 impl MetadataCacheMetrics {
@@ -101,6 +107,9 @@ impl MetadataCacheMetrics {
             evictions: self.evictions.load(Ordering::Relaxed),
             stale_handle_errors: self.stale_handle_errors.load(Ordering::Relaxed),
             disk_hits: self.disk_hits.load(Ordering::Relaxed),
+            head_hits: self.head_hits.load(Ordering::Relaxed),
+            head_misses: self.head_misses.load(Ordering::Relaxed),
+            head_disk_hits: self.head_disk_hits.load(Ordering::Relaxed),
         }
     }
 }
@@ -114,6 +123,9 @@ pub struct MetadataCacheMetricsSnapshot {
     pub evictions: u64,
     pub stale_handle_errors: u64,
     pub disk_hits: u64,
+    pub head_hits: u64,
+    pub head_misses: u64,
+    pub head_disk_hits: u64,
 }
 
 impl MetadataCacheMetricsSnapshot {
@@ -168,9 +180,24 @@ impl MetadataCache {
         self.config.enabled
     }
 
-    /// Record a disk hit (RAM miss but found on disk)
+    /// Record a disk hit (RAM miss but found on disk) — GET path
     pub fn record_disk_hit(&self) {
         self.metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a HEAD RAM hit
+    pub fn record_head_hit(&self) {
+        self.metrics.head_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a HEAD RAM miss (reached disk lookup)
+    pub fn record_head_miss(&self) {
+        self.metrics.head_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a HEAD disk hit (RAM miss but found on disk)
+    pub fn record_head_disk_hit(&self) {
+        self.metrics.head_disk_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the configuration

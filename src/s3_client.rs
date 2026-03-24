@@ -346,7 +346,13 @@ impl S3Client {
                     }
                 }
                 None => {
-                    // No IPs available — forward with original hostname (Requirement 7.1)
+                    // No IPs available yet — register the endpoint so the DNS refresh
+                    // background task picks it up, then forward with original hostname (Requirement 7.1)
+                    let pool_manager = Arc::clone(&self.pool_manager);
+                    let host = context.host.clone();
+                    tokio::spawn(async move {
+                        pool_manager.write().await.register_endpoint(&host).await;
+                    });
                     (context.uri.clone(), None)
                 }
             }
@@ -540,10 +546,22 @@ impl S3Client {
         }
     }
 
-    /// Refresh DNS for all connection pools
+    /// Register an endpoint for DNS-based IP distribution and perform an immediate resolve.
+    pub async fn register_endpoint(&self, endpoint: &str) {
+        let mut pool_manager = self.pool_manager.write().await;
+        pool_manager.register_endpoint(endpoint).await;
+    }
+
+    /// Refresh DNS for all registered endpoints and clear health tracker failure counts.
+    ///
+    /// Clearing the tracker on each refresh gives previously-excluded IPs a clean slate
+    /// when they are restored by the DNS refresh.
     pub async fn refresh_dns(&self) -> Result<()> {
         let mut pool_manager = self.pool_manager.write().await;
-        pool_manager.refresh_dns().await
+        pool_manager.refresh_dns().await?;
+        // Clear failure counts so restored IPs aren't immediately re-excluded
+        self.health_tracker.clear();
+        Ok(())
     }
     /// Build conditional request headers for cache validation (Requirements 4.1, 4.2, 4.3, 4.4, 3.6, 3.8)
     pub fn build_conditional_headers(

@@ -302,7 +302,23 @@ impl ConnectionPoolManager {
         Ok(ip_addresses)
     }
 
-    /// Refresh DNS for all endpoints
+    /// Register an endpoint for DNS-based IP distribution.
+    ///
+    /// Performs an immediate DNS resolution and seeds the IP distributor.
+    /// Subsequent calls to `refresh_dns` will keep the distributor up to date.
+    /// No-op if the endpoint is already registered or covered by `endpoint_overrides`.
+    pub async fn register_endpoint(&mut self, endpoint: &str) {
+        // Skip if already registered or covered by a static override
+        if self.resolved_ips.contains_key(endpoint) || self.endpoint_overrides.contains_key(endpoint) {
+            return;
+        }
+        info!(endpoint = %endpoint, "Registering endpoint for DNS-based IP distribution");
+        if let Err(e) = self.refresh_endpoint_dns(endpoint).await {
+            warn!("Initial DNS resolution failed for endpoint {}: {}", endpoint, e);
+        }
+    }
+
+    /// Refresh DNS for all registered endpoints whose refresh interval has elapsed.
     pub async fn refresh_dns(&mut self) -> Result<()> {
         let now = std::time::SystemTime::now();
         let endpoints_to_refresh: Vec<String> = self
@@ -330,7 +346,10 @@ impl ConnectionPoolManager {
         Ok(())
     }
 
-    /// Refresh DNS for a specific endpoint
+    /// Refresh DNS for a specific endpoint and update the IP distributor.
+    ///
+    /// Also clears health tracker failure counts for any IPs that are restored
+    /// by the refresh, so previously-excluded IPs get a clean slate.
     pub async fn refresh_endpoint_dns(&mut self, endpoint: &str) -> Result<()> {
         debug!("Refreshing DNS for endpoint: {}", endpoint);
 

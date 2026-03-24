@@ -436,6 +436,11 @@ impl HttpProxy {
         Arc::clone(&self.cache_manager)
     }
 
+    /// Get reference to S3 client for DNS refresh and IP distribution management
+    pub fn get_s3_client(&self) -> Arc<S3Client> {
+        Arc::clone(&self.s3_client)
+    }
+
     /// Get reference to S3 client's connection pool for health/metrics monitoring
     pub fn get_connection_pool(
         &self,
@@ -3813,7 +3818,7 @@ impl HttpProxy {
 
             // Record cache hit statistics
             cache_manager.update_statistics(true, range_size, method == Method::HEAD);
-            cache_manager.record_bucket_cache_access(&cache_key, true, false).await;
+            cache_manager.record_bucket_cache_access(&cache_key, true, method == Method::HEAD).await;
 
             return Ok(response);
         }
@@ -4409,8 +4414,8 @@ impl HttpProxy {
 
         // Record cache hit statistics (buffered path — RAM and streaming paths record separately)
         let range_size = range_spec.end - range_spec.start + 1;
-        cache_manager.update_statistics(true, range_size, false);
-        cache_manager.record_bucket_cache_access(cache_key, true, false).await;
+        cache_manager.update_statistics(true, range_size, method == Method::HEAD);
+        cache_manager.record_bucket_cache_access(cache_key, true, method == Method::HEAD).await;
 
         // Log cache hit at INFO level for observability
         let cache_tier = if is_ram_hit { "RAM" } else { "Disk" };
@@ -5720,7 +5725,7 @@ impl HttpProxy {
                             cache_key
                         );
                         cache_manager.update_statistics(true, total_size, false);
-                        cache_manager.record_bucket_cache_access(&cache_key, true, false).await;
+                        cache_manager.record_bucket_cache_access(&cache_key, true, method == Method::HEAD).await;
 
                         let header_map: hyper::header::HeaderMap = headers
                             .iter()
@@ -5756,7 +5761,7 @@ impl HttpProxy {
             cache_key
         );
         cache_manager.update_statistics(false, 0, false);
-        cache_manager.record_bucket_cache_access(&cache_key, false, false).await;
+        cache_manager.record_bucket_cache_access(&cache_key, false, method == Method::HEAD).await;
         Self::forward_get_head_to_s3_and_cache(
             method, uri, host, headers, cache_key, cache_manager, s3_client, range_handler, proxy_referer,
         )

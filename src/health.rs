@@ -189,11 +189,17 @@ impl HealthManager {
             .as_millis() as u64;
 
         let total_ips: usize = stats.endpoints.iter().map(|e| e.total_distributor_ips).sum();
-        let status = if total_ips > 0 {
-            HealthStatus::Healthy
-        } else {
-            // No IPs in any distributor — may be pre-DNS-refresh or all excluded
+
+        // Healthy if IPs are populated, or if no endpoints have been registered yet
+        // (normal at startup before first request). Only Degraded if an endpoint is
+        // registered but has zero IPs — meaning DNS resolution failed for a known endpoint.
+        let all_registered_empty = !stats.endpoints.is_empty()
+            && stats.endpoints.iter().all(|e| e.total_distributor_ips == 0);
+
+        let status = if all_registered_empty {
             HealthStatus::Degraded
+        } else {
+            HealthStatus::Healthy
         };
 
         ComponentHealth {

@@ -218,6 +218,7 @@ async fn main() -> Result<()> {
     let cache_manager_ref = http_proxy.get_cache_manager();
     let connection_pool_ref = http_proxy.get_connection_pool();
     let compression_handler_ref = http_proxy.get_compression_handler();
+    let s3_client_ref = http_proxy.get_s3_client();
 
     // Wire cache manager and connection pool into shutdown coordinator
     shutdown_coordinator.set_cache_manager(cache_manager_ref.clone());
@@ -363,6 +364,40 @@ async fn main() -> Result<()> {
         });
     } else {
         debug!("Journal consolidation disabled (shared storage mode not enabled)");
+    }
+
+    // Start background DNS refresh task for IP distribution
+    // Periodically re-resolves S3 endpoints so the round-robin distributor stays current
+    // as S3 rotates its IP addresses. Uses pool_check_interval from config (default: 10s).
+    if config.connection_pool.ip_distribution_enabled {
+        let dns_refresh_interval = config.connection_pool.pool_check_interval;
+        let dns_refresh_client = s3_client_ref.clone();
+        let mut dns_refresh_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+
+        info!(
+            "Starting DNS refresh background task (interval: {}s)",
+            dns_refresh_interval.as_secs()
+        );
+
+        let _dns_refresh_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(dns_refresh_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = dns_refresh_client.refresh_dns().await {
+                            warn!("DNS refresh failed: {}", e);
+                        }
+                    }
+                    _ = dns_refresh_shutdown.wait_for_shutdown() => {
+                        info!("DNS refresh background task received shutdown signal");
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        debug!("DNS refresh disabled (ip_distribution_enabled=false)");
     }
 
     // Start background log cleanup task

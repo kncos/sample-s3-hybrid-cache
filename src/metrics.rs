@@ -276,7 +276,7 @@ pub struct AtomicMetadataStats {
     write_mode_fallbacks: u64,
 }
 
-/// Per-bucket cache hit/miss counters.
+/// Per-bucket (or per-prefix) cache hit/miss counters.
 /// Only tracked for buckets that have a `_settings.json` file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BucketCacheStats {
@@ -305,6 +305,8 @@ pub struct MetricsManager {
     coalescing_stats: Arc<RwLock<CoalescingStats>>,
     /// Per-bucket cache hit/miss counters (only for buckets with `_settings.json`)
     bucket_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
+    /// Per-prefix cache hit/miss counters keyed by "bucket/prefix"
+    prefix_cache_stats: Arc<RwLock<HashMap<String, BucketCacheStats>>>,
     last_metrics: Arc<RwLock<Option<SystemMetrics>>>,
     otlp_exporter: Option<Arc<RwLock<OtlpExporter>>>,
     /// Active HTTP connections counter (shared with HttpProxy)
@@ -477,6 +479,7 @@ impl MetricsManager {
             atomic_metadata_stats: Arc::new(RwLock::new(AtomicMetadataStats::default())),
             coalescing_stats: Arc::new(RwLock::new(CoalescingStats::default())),
             bucket_cache_stats: Arc::new(RwLock::new(HashMap::new())),
+            prefix_cache_stats: Arc::new(RwLock::new(HashMap::new())),
             last_metrics: Arc::new(RwLock::new(None)),
             otlp_exporter: None,
             active_connections: None,
@@ -1784,6 +1787,28 @@ impl MetricsManager {
     /// Returns a snapshot of hit/miss counts keyed by bucket name.
     pub async fn get_bucket_cache_stats(&self) -> HashMap<String, BucketCacheStats> {
         let stats = self.bucket_cache_stats.read().await;
+        stats.clone()
+    }
+
+    /// Record a per-prefix cache hit. Key is "bucket/prefix".
+    pub async fn record_prefix_cache_hit(&self, key: &str, is_head: bool) {
+        let mut stats = self.prefix_cache_stats.write().await;
+        let entry = stats.entry(key.to_string()).or_default();
+        entry.hit_count += 1;
+        if is_head { entry.head_hit_count += 1; } else { entry.get_hit_count += 1; }
+    }
+
+    /// Record a per-prefix cache miss. Key is "bucket/prefix".
+    pub async fn record_prefix_cache_miss(&self, key: &str, is_head: bool) {
+        let mut stats = self.prefix_cache_stats.write().await;
+        let entry = stats.entry(key.to_string()).or_default();
+        entry.miss_count += 1;
+        if is_head { entry.head_miss_count += 1; } else { entry.get_miss_count += 1; }
+    }
+
+    /// Get per-prefix cache stats. Keys are "bucket/prefix".
+    pub async fn get_prefix_cache_stats(&self) -> HashMap<String, BucketCacheStats> {
+        let stats = self.prefix_cache_stats.read().await;
         stats.clone()
     }
 

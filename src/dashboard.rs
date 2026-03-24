@@ -701,14 +701,10 @@ main {
 .flow-layout {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 1.5rem;
+    column-gap: 1.5rem;
+    row-gap: 0;
     margin-bottom: 1.5rem;
-}
-
-.flow-column {
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
+    align-items: start;
 }
 
 .flow-header {
@@ -716,6 +712,16 @@ main {
     color: #2c3e50;
     margin: 0 0 0.75rem 0;
     font-size: 1.1rem;
+    align-self: end;
+}
+
+.flow-summary {
+    margin-bottom: 0.5rem;
+    padding: 0.5rem 1rem;
+    background: #e8f4f8;
+    border-radius: 6px;
+    border: 1px solid #bee5eb;
+    align-self: stretch;
 }
 
 .flow-card {
@@ -723,6 +729,7 @@ main {
     border: 1px solid #dee2e6;
     border-radius: 6px;
     padding: 0.75rem 1rem;
+    align-self: stretch;
 }
 
 .flow-card h4 {
@@ -743,14 +750,7 @@ main {
     color: #6c757d;
     font-size: 0.8rem;
     padding: 0.25rem 0;
-}
-
-.flow-summary {
-    margin-top: 0.5rem;
-    padding: 0.5rem 1rem;
-    background: #e8f4f8;
-    border-radius: 6px;
-    border: 1px solid #bee5eb;
+    align-self: center;
 }
 
 .overall-card {
@@ -1150,14 +1150,15 @@ function renderCacheStats(data) {
         : '';
 
     // HEAD flow metrics
-    const headRamHits = data.metadata_cache?.hits || 0;
-    const headDiskHits = data.metadata_cache?.disk_hits || 0;
-    const headMisses = data.metadata_cache?.misses || 0;
-    const headTotal = headRamHits + headDiskHits + headMisses;
+    const headRamHits = data.metadata_cache?.head_hits || 0;
+    const headDiskHits = data.metadata_cache?.head_disk_hits || 0;
+    // headRamMisses = HEAD requests that reached disk (head_disk_hits + HEAD S3 fetches)
+    const headRamMisses = data.metadata_cache?.head_misses || 0;
+    const headS3Fetches = headRamMisses - headDiskHits;
+    const headTotal = headRamHits + headRamMisses;
     const headOverallHitRate = headTotal > 0 ? ((headRamHits + headDiskHits) / headTotal * 100).toFixed(1) : '0.0';
-    const headRamHitRate = (headRamHits + headMisses + headDiskHits) > 0 ? (headRamHits / (headRamHits + headMisses + headDiskHits) * 100).toFixed(1) : '0.0';
-    const headDiskTotal = headDiskHits + headMisses;
-    const headDiskHitRate = headDiskTotal > 0 ? (headDiskHits / headDiskTotal * 100).toFixed(1) : '0.0';
+    const headRamHitRate = headTotal > 0 ? (headRamHits / headTotal * 100).toFixed(1) : '0.0';
+    const headDiskHitRate = headRamMisses > 0 ? (headDiskHits / headRamMisses * 100).toFixed(1) : '0.0';
 
     // GET flow metrics
     const getRamHits = data.ram_cache?.hits || 0;
@@ -1172,59 +1173,60 @@ function renderCacheStats(data) {
 
     return `
         <div class="flow-layout">
-            <div class="flow-column">
-                <h3 class="flow-header">HEAD Requests</h3>
-                <div class="flow-summary">
-                    ${stat('Total', formatNumber(headTotal), 'Total HEAD requests processed.')}
-                    ${stat('Overall Hit Rate', headOverallHitRate + '%', 'Percentage of HEAD requests served from any cache tier without S3 fetch.')}
-                </div>
-                <div class="flow-card">
-                    <h4>RAM Metadata</h4>
-                    ${stat('Hit Rate', headRamHitRate + '%', 'Percentage of HEAD metadata lookups served from RAM without disk I/O.')}
-                    ${stat('Hits', formatNumber(headRamHits), 'HEAD metadata lookups served from RAM.')}
-                    ${stat('Misses', formatNumber(headDiskHits + headMisses), 'HEAD metadata lookups not found in RAM (falls through to disk).')}
-                    ${stat('Entries', formatNumber(data.metadata_cache?.entries || 0) + ' / ' + formatNumber(data.metadata_cache?.max_entries || 0), 'Metadata entries currently held in RAM vs configured maximum.')}
-                    ${stat('Evictions', formatNumber(data.metadata_cache?.evictions || 0), 'Metadata entries evicted from RAM when at capacity (LRU).')}
-                    ${staleRefreshesDisplay}
-                    ${staleHandleDisplay}
-                </div>
-                <div class="flow-arrow">▼ miss</div>
-                <div class="flow-card">
-                    <h4>Disk Metadata</h4>
-                    ${stat('Hit Rate', headDiskHitRate + '%', 'Percentage of disk metadata lookups that found unexpired .meta files.')}
-                    ${stat('Hits', formatNumber(headDiskHits), 'HEAD lookups served from unexpired .meta files on disk.')}
-                </div>
-                <div class="flow-arrow">▼ miss</div>
-                <div class="flow-card flow-card-s3">
-                    ${stat('S3 Fetch', formatNumber(headMisses), 'HEAD requests forwarded to S3 because no cached metadata was found on RAM or disk.')}
-                </div>
+            <h3 class="flow-header">HEAD Requests</h3>
+            <h3 class="flow-header">GET Requests</h3>
+
+            <div class="flow-summary">
+                ${stat('Total', formatNumber(headTotal), 'Total HEAD requests processed.')}
+                ${stat('Overall Hit Rate', headOverallHitRate + '%', 'Percentage of HEAD requests served from any cache tier without S3 fetch.')}
             </div>
-            
-            <div class="flow-column">
-                <h3 class="flow-header">GET Requests</h3>
-                <div class="flow-summary">
-                    ${stat('Total', formatNumber(getTotal), 'Total GET requests processed.')}
-                    ${stat('Overall Hit Rate', getOverallHitRate + '%', 'Percentage of GET requests served from any cache tier without S3 fetch.')}
-                </div>
-                <div class="flow-card">
-                    <h4>RAM Range Cache</h4>
-                    ${stat('Hit Rate', getRamHitRate + '%', 'Percentage of GET range lookups served from RAM without disk I/O.')}
-                    ${stat('Hits', formatNumber(getRamHits), 'GET requests served from RAM range cache.')}
-                    ${stat('Misses', formatNumber(getRamMisses), 'GET requests not found in RAM (falls through to disk).')}
-                    ${stat('Size', (data.ram_cache?.size_human || '0 B') + (data.ram_cache?.max_size_human ? ' / ' + data.ram_cache.max_size_human : ''), 'Current RAM range cache usage vs configured maximum.')}
-                    ${stat('Evictions', formatNumber(data.ram_cache?.evictions || 0), 'Range entries evicted from RAM to make room for new data.')}
-                </div>
-                <div class="flow-arrow">▼ miss</div>
-                <div class="flow-card">
-                    <h4>Disk Range Cache</h4>
-                    ${stat('Hit Rate', getDiskHitRate + '%', 'Percentage of disk range lookups that found cached data.')}
-                    ${stat('Hits', formatNumber(getDiskHits), 'GET requests served from cached range data on disk.')}
-                    ${stat('Evictions', formatNumber(data.disk_cache?.evictions || 0), 'Cached ranges removed during eviction to free disk space.')}
-                </div>
-                <div class="flow-arrow">▼ miss</div>
-                <div class="flow-card flow-card-s3">
-                    ${stat('S3 Fetch', formatNumber(getDiskMisses), 'GET requests forwarded to S3 because no cached range data was found on RAM or disk.')}
-                </div>
+            <div class="flow-summary">
+                ${stat('Total', formatNumber(getTotal), 'Total GET requests processed.')}
+                ${stat('Overall Hit Rate', getOverallHitRate + '%', 'Percentage of GET requests served from any cache tier without S3 fetch.')}
+            </div>
+
+            <div class="flow-card">
+                <h4>RAM Metadata</h4>
+                ${stat('Hit Rate', headRamHitRate + '%', 'Percentage of HEAD metadata lookups served from RAM without disk I/O.')}
+                ${stat('Hits', formatNumber(headRamHits), 'HEAD metadata lookups served from RAM.')}
+                ${stat('Misses', formatNumber(headRamMisses), 'HEAD metadata lookups not found in RAM (falls through to disk).')}
+                ${stat('Entries', formatNumber(data.metadata_cache?.entries || 0) + ' / ' + formatNumber(data.metadata_cache?.max_entries || 0), 'Metadata entries currently held in RAM vs configured maximum.')}
+                ${stat('Evictions', formatNumber(data.metadata_cache?.evictions || 0), 'Metadata entries evicted from RAM when at capacity (LRU).')}
+                ${staleRefreshesDisplay}
+                ${staleHandleDisplay}
+            </div>
+            <div class="flow-card">
+                <h4>RAM Range Cache</h4>
+                ${stat('Hit Rate', getRamHitRate + '%', 'Percentage of GET range lookups served from RAM without disk I/O.')}
+                ${stat('Hits', formatNumber(getRamHits), 'GET requests served from RAM range cache.')}
+                ${stat('Misses', formatNumber(getRamMisses), 'GET requests not found in RAM (falls through to disk).')}
+                ${stat('Size', (data.ram_cache?.size_human || '0 B') + (data.ram_cache?.max_size_human ? ' / ' + data.ram_cache.max_size_human : ''), 'Current RAM range cache usage vs configured maximum.')}
+                ${stat('Evictions', formatNumber(data.ram_cache?.evictions || 0), 'Range entries evicted from RAM to make room for new data.')}
+            </div>
+
+            <div class="flow-arrow">▼ miss</div>
+            <div class="flow-arrow">▼ miss</div>
+
+            <div class="flow-card">
+                <h4>Disk Metadata</h4>
+                ${stat('Hit Rate', headDiskHitRate + '%', 'Percentage of disk metadata lookups that found unexpired .meta files.')}
+                ${stat('Hits', formatNumber(headDiskHits), 'HEAD lookups served from unexpired .meta files on disk.')}
+            </div>
+            <div class="flow-card">
+                <h4>Disk Range Cache</h4>
+                ${stat('Hit Rate', getDiskHitRate + '%', 'Percentage of disk range lookups that found cached data.')}
+                ${stat('Hits', formatNumber(getDiskHits), 'GET requests served from cached range data on disk.')}
+                ${stat('Evictions', formatNumber(data.disk_cache?.evictions || 0), 'Cached ranges removed during eviction to free disk space.')}
+            </div>
+
+            <div class="flow-arrow">▼ miss</div>
+            <div class="flow-arrow">▼ miss</div>
+
+            <div class="flow-card flow-card-s3">
+                ${stat('S3 Fetch', formatNumber(headS3Fetches), 'HEAD requests forwarded to S3 because no cached metadata was found on RAM or disk.')}
+            </div>
+            <div class="flow-card flow-card-s3">
+                ${stat('S3 Fetch', formatNumber(getDiskMisses), 'GET requests forwarded to S3 because no cached range data was found on RAM or disk.')}
             </div>
         </div>
         
@@ -1327,9 +1329,9 @@ let helpCounter = 0;
 
 function stat(label, value, help) {
     const id = 'help-' + (helpCounter++);
-    const vis = expandedHelp.has(label) ? ' visible' : '';
+    const vis = expandedHelp.has(id) ? ' visible' : '';
     return `<div class="stat-item">
-        <span class="stat-label">${label} <span class="help-icon" onclick="toggleHelp('${label}','${id}')">ⓘ</span></span>
+        <span class="stat-label">${label} <span class="help-icon" onclick="toggleHelp('${id}')">ⓘ</span></span>
         <span class="stat-value">${value}</span>
         <span class="help-text${vis}" id="${id}">${help}</span>
     </div>`;
@@ -1337,22 +1339,22 @@ function stat(label, value, help) {
 
 function statWarn(label, value, help) {
     const id = 'help-' + (helpCounter++);
-    const vis = expandedHelp.has(label) ? ' visible' : '';
+    const vis = expandedHelp.has(id) ? ' visible' : '';
     return `<div class="stat-item warning">
-        <span class="stat-label">${label} <span class="help-icon" onclick="toggleHelp('${label}','${id}')">ⓘ</span></span>
+        <span class="stat-label">${label} <span class="help-icon" onclick="toggleHelp('${id}')">ⓘ</span></span>
         <span class="stat-value warning-value">${value}</span>
         <span class="help-text${vis}" id="${id}">${help}</span>
     </div>`;
 }
 
-function toggleHelp(label, id) {
+function toggleHelp(id) {
     const el = document.getElementById(id);
     if (el.classList.contains('visible')) {
         el.classList.remove('visible');
-        expandedHelp.delete(label);
+        expandedHelp.delete(id);
     } else {
         el.classList.add('visible');
-        expandedHelp.add(label);
+        expandedHelp.add(id);
     }
 }
 
@@ -1423,8 +1425,8 @@ function renderBucketStats() {
                     rowKey: b.bucket + '::' + po.prefix,
                     bucket: s.prefix_overrides.length > 0 && !hasBucketLevelOverrides ? b.bucket : '',
                     prefix: po.prefix,
-                    headHits: b.head_hit_count || 0, headTotal: (b.head_hit_count || 0) + (b.head_miss_count || 0),
-                    getHits: b.get_hit_count || 0, getTotal: (b.get_hit_count || 0) + (b.get_miss_count || 0),
+                    headHits: po.head_hit_count || 0, headTotal: (po.head_hit_count || 0) + (po.head_miss_count || 0),
+                    getHits: po.get_hit_count || 0, getTotal: (po.get_hit_count || 0) + (po.get_miss_count || 0),
                     settings: po
                 });
             });
@@ -1733,6 +1735,9 @@ impl ApiHandler {
                     evictions: metadata_stats.evictions,
                     stale_refreshes: metadata_stats.stale_refreshes,
                     stale_handle_errors: metadata_stats.stale_handle_errors,
+                    head_hits: metadata_stats.head_hits,
+                    head_misses: metadata_stats.head_misses,
+                    head_disk_hits: metadata_stats.head_disk_hits,
                 },
                 disk_cache: CacheStats {
                     hit_rate: {
@@ -1972,6 +1977,13 @@ impl ApiHandler {
             std::collections::HashMap::new()
         };
 
+        // Get per-prefix cache stats from metrics manager
+        let prefix_cache_stats = if let Some(mm) = metrics_manager_guard.as_ref() {
+            mm.read().await.get_prefix_cache_stats().await
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let mut entries = Vec::with_capacity(bucket_names.len());
         for bucket in &bucket_names {
             // Resolve bucket-level settings (empty path = bucket level, no prefix match)
@@ -1980,15 +1992,23 @@ impl ApiHandler {
 
             let prefix_overrides: Vec<PrefixOverrideSummary> = prefix_overrides_raw
                 .iter()
-                .map(|po| PrefixOverrideSummary {
-                    prefix: po.prefix.clone(),
-                    get_ttl: po.get_ttl.map(crate::bucket_settings::format_duration),
-                    head_ttl: po.head_ttl.map(crate::bucket_settings::format_duration),
-                    put_ttl: po.put_ttl.map(crate::bucket_settings::format_duration),
-                    read_cache_enabled: po.read_cache_enabled,
-                    write_cache_enabled: po.write_cache_enabled,
-                    compression_enabled: po.compression_enabled,
-                    ram_cache_eligible: po.ram_cache_eligible,
+                .map(|po| {
+                    let prefix_key = format!("{}/{}", bucket, po.prefix);
+                    let ps = prefix_cache_stats.get(&prefix_key);
+                    PrefixOverrideSummary {
+                        prefix: po.prefix.clone(),
+                        get_ttl: po.get_ttl.map(crate::bucket_settings::format_duration),
+                        head_ttl: po.head_ttl.map(crate::bucket_settings::format_duration),
+                        put_ttl: po.put_ttl.map(crate::bucket_settings::format_duration),
+                        read_cache_enabled: po.read_cache_enabled,
+                        write_cache_enabled: po.write_cache_enabled,
+                        compression_enabled: po.compression_enabled,
+                        ram_cache_eligible: po.ram_cache_eligible,
+                        head_hit_count: ps.map_or(0, |s| s.head_hit_count),
+                        head_miss_count: ps.map_or(0, |s| s.head_miss_count),
+                        get_hit_count: ps.map_or(0, |s| s.get_hit_count),
+                        get_miss_count: ps.map_or(0, |s| s.get_miss_count),
+                    }
                 })
                 .collect();
             let prefix_count = prefix_overrides.len();
@@ -2396,6 +2416,10 @@ pub struct MetadataCacheStats {
     pub evictions: u64,
     pub stale_refreshes: u64,
     pub stale_handle_errors: u64,
+    /// HEAD-request-specific counters (subset of hits/misses/disk_hits)
+    pub head_hits: u64,
+    pub head_misses: u64,
+    pub head_disk_hits: u64,
 }
 
 /// Individual cache statistics
@@ -2528,6 +2552,11 @@ pub struct PrefixOverrideSummary {
     pub compression_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ram_cache_eligible: Option<bool>,
+    // Per-prefix hit/miss stats
+    pub head_hit_count: u64,
+    pub head_miss_count: u64,
+    pub get_hit_count: u64,
+    pub get_miss_count: u64,
 }
 
 /// Validate log query parameters

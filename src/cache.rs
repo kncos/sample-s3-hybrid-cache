@@ -360,18 +360,6 @@ pub enum CacheEvictionAlgorithm {
     TinyLFU, // Simplified frequency-recency hybrid inspired by TinyLFU
 }
 
-/// Cache entry size information
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CacheEntrySize {
-    pub cache_key: String,
-    pub header_size: u64,
-    pub body_size: u64,
-    pub metadata_size: u64,
-    pub total_size: u64,
-    pub compressed: bool,
-    pub compression_ratio: Option<f32>,
-}
-
 /// Cache usage breakdown by type
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CacheUsageBreakdown {
@@ -882,7 +870,23 @@ impl CacheManager {
     /// Convenience method used by TTL lookups and future tasks (4.4-4.7).
     pub async fn resolve_settings(&self, path: &str) -> crate::bucket_settings::ResolvedSettings {
         let bucket = crate::bucket_settings::BucketSettingsManager::extract_bucket(path).unwrap_or("");
-        self.bucket_settings_manager.resolve(bucket, path).await
+        // Strip the leading "/{bucket}/" or "{bucket}/" so prefix matching in cascade
+        // works against just the object key (e.g. "many/10x100M/..."), consistent
+        // with how _settings.json prefix_overrides are documented and tested.
+        let object_path = if bucket.is_empty() {
+            path
+        } else {
+            let with_slash = format!("/{}/", bucket);
+            let without_slash = format!("{}/", bucket);
+            if let Some(rest) = path.strip_prefix(with_slash.as_str()) {
+                rest
+            } else if let Some(rest) = path.strip_prefix(without_slash.as_str()) {
+                rest
+            } else {
+                path
+            }
+        };
+        self.bucket_settings_manager.resolve(bucket, object_path).await
     }
 
     /// Get the effective GET TTL for a given path
@@ -1466,11 +1470,6 @@ impl CacheManager {
                 debug!("Cache hit (RAM) for key: {}", cache_key);
                 self.update_ram_cache_hit_statistics();
                 let cache_entry = self.convert_ram_entry_to_cache_entry(ram_entry)?;
-                self.update_statistics(
-                    true,
-                    Self::calculate_entry_size(&cache_entry).total_size,
-                    false,
-                );
                 return Ok(Some(cache_entry));
             }
         }
@@ -1486,8 +1485,6 @@ impl CacheManager {
                 let _ = self.promote_to_ram_cache(&cache_entry).await;
             }
 
-            let entry_size = Self::calculate_entry_size(&cache_entry).total_size;
-            self.update_statistics(true, entry_size, false);
             return Ok(Some(cache_entry));
         }
 
@@ -1496,7 +1493,6 @@ impl CacheManager {
             "Cache miss for key: {} (not found in RAM or disk)",
             cache_key
         );
-        self.update_statistics(false, 0, false);
         Ok(None)
     }
 
@@ -2707,12 +2703,35 @@ impl CacheManager {
             return;
         }
 
+        // Extract the object path (everything after "bucket/") for prefix matching
+        let trimmed = cache_key.strip_prefix('/').unwrap_or(cache_key);
+        let object_path = trimmed
+            .find('/')
+            .map(|pos| &trimmed[pos + 1..])
+            .unwrap_or("");
+
+        // Find the matching prefix override (longest prefix match)
+        let matched_prefix = {
+            let overrides = self.bucket_settings_manager.get_prefix_overrides(&bucket).await;
+            overrides
+                .into_iter()
+                .filter(|po| object_path.starts_with(&po.prefix))
+                .max_by_key(|po| po.prefix.len())
+                .map(|po| po.prefix)
+        };
+
         if let Some(mm_guard) = self.metrics_manager.read().await.as_ref() {
             let mm = mm_guard.read().await;
             if hit {
                 mm.record_bucket_cache_hit(&bucket, is_head).await;
+                if let Some(ref prefix) = matched_prefix {
+                    mm.record_prefix_cache_hit(&format!("{}/{}", bucket, prefix), is_head).await;
+                }
             } else {
                 mm.record_bucket_cache_miss(&bucket, is_head).await;
+                if let Some(ref prefix) = matched_prefix {
+                    mm.record_prefix_cache_miss(&format!("{}/{}", bucket, prefix), is_head).await;
+                }
             }
         }
     }
@@ -2778,7 +2797,6 @@ impl CacheManager {
                     drop(inner); // Release lock before updating statistics
                     debug!("Range cache hit (RAM) for {}-{}", range.start, range.end);
                     self.update_ram_cache_hit_statistics();
-                    self.update_statistics(true, data_len as u64, false);
                     return Ok((data, true));
                 }
             }
@@ -2796,7 +2814,6 @@ impl CacheManager {
                     "Disk cache miss for range {}-{}: {}",
                     range.start, range.end, e
                 );
-                self.update_statistics(false, 0, false);
                 return Err(e);
             }
         };
@@ -2848,9 +2865,9 @@ impl CacheManager {
             }
         }
 
-        self.update_statistics(true, range_data.len() as u64, false);
         Ok((range_data, false))
     }
+
 
     /// Check if write cache can accommodate new entry
     pub fn can_write_cache_accommodate(&self, entry_size: u64) -> bool {
@@ -2870,36 +2887,6 @@ impl CacheManager {
         new_total <= max_allowed
     }
 
-    // NOTE: update_write_cache_size() method has been removed.
-    // Write cache size tracking is now handled by JournalConsolidator through journal entries.
-    // The journal entry contains is_write_cached flag and compressed_size for size delta calculation.
-
-    /// Calculate cache entry size
-    pub fn calculate_entry_size(entry: &CacheEntry) -> CacheEntrySize {
-        let header_size = entry
-            .headers
-            .iter()
-            .map(|(k, v)| k.len() + v.len())
-            .sum::<usize>() as u64;
-
-        let body_size = entry.body.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
-
-        let ranges_size = entry.ranges.iter().map(|r| r.data.len()).sum::<usize>() as u64;
-
-        let metadata_size = std::mem::size_of::<CacheMetadata>() as u64;
-
-        let total_size = header_size + body_size + ranges_size + metadata_size;
-
-        CacheEntrySize {
-            cache_key: entry.cache_key.clone(),
-            header_size,
-            body_size: body_size + ranges_size,
-            metadata_size,
-            total_size,
-            compressed: false, // Will be set by compression handler
-            compression_ratio: None,
-        }
-    }
 
     /// Compress cache entry data with external compression handler
     pub fn compress_cache_entry_with_handler(
@@ -6476,8 +6463,7 @@ impl CacheManager {
             // Check if HEAD is still valid (not expired)
             if !metadata.is_head_expired() {
                 debug!("HEAD cache hit (MetadataCache RAM) for key: {}", cache_key);
-                // Note: HEAD access tracking is handled by MetadataCache internally
-                // No need for journal-based tracking since HEAD doesn't have ranges
+                self.metadata_cache.record_head_hit();
                 return Ok(Some(self.convert_new_metadata_to_head_entry(&metadata)));
             } else {
                 debug!("HEAD expired in MetadataCache for key: {}", cache_key);
@@ -6487,6 +6473,8 @@ impl CacheManager {
         }
 
         // Second tier: Check disk cache (.meta file in metadata/ directory)
+        // RAM miss for HEAD purposes — reached disk lookup
+        self.metadata_cache.record_head_miss();
         let metadata_path = self.get_new_metadata_file_path(cache_key);
         if metadata_path.exists() {
             match self.read_new_cache_metadata_from_disk(&metadata_path).await {
@@ -6497,9 +6485,7 @@ impl CacheManager {
                     // Check if HEAD is still valid
                     if !metadata.is_head_expired() {
                         debug!("HEAD cache hit (disk .meta) for key: {}", cache_key);
-                        self.metadata_cache.record_disk_hit();
-                        // Note: HEAD access tracking is handled by MetadataCache internally
-                        // No need for journal-based tracking since HEAD doesn't have ranges
+                        self.metadata_cache.record_head_disk_hit();
                         return Ok(Some(self.convert_new_metadata_to_head_entry(&metadata)));
                     } else {
                         debug!("HEAD expired in disk .meta for key: {}", cache_key);
@@ -6516,7 +6502,6 @@ impl CacheManager {
             "HEAD cache miss (unified) for key: {} (not found in any tier)",
             cache_key
         );
-        self.update_statistics(false, 0, true);
         Ok(None)
     }
 
@@ -7006,12 +6991,6 @@ impl CacheManager {
         // Store full object as range using new architecture
         self.store_full_object_as_range_new(cache_key, response, object_metadata)
             .await?;
-
-        self.update_statistics(
-            false,
-            Self::calculate_entry_size(&cache_entry).total_size,
-            false,
-        );
 
         info!(
             "Successfully stored cache entry with headers for key: {}",
@@ -9175,7 +9154,6 @@ impl CacheManager {
             "Disk cache miss for key: {} (metadata file doesn't exist)",
             cache_key
         );
-        self.update_statistics(false, 0, false);
         Ok(None)
     }
 
