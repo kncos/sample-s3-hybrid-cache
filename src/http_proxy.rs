@@ -5771,8 +5771,8 @@ impl HttpProxy {
     /// Forward GET/HEAD request to S3 and cache the response with streaming support
     /// Requirement 2.8: When object size is NOT known, forward full GET to S3 and cache response
     ///
-    /// For streaming responses (> 1MB), uses TeeStream to simultaneously stream to client
-    /// and cache in background. For buffered responses (< 1MB), caches synchronously.
+    /// Uses TeeStream to simultaneously stream to client and cache in background.
+    /// For buffered responses (non-streaming body), caches synchronously.
     async fn forward_get_head_to_s3_and_cache(
         method: Method,
         uri: hyper::Uri,
