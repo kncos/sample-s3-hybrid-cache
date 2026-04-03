@@ -24,7 +24,7 @@ Technical architecture overview and design principles for S3 Proxy.
 - Acts as intelligent cache between client and S3
 
 ### Streaming Architecture
-- Large responses (> 1MB) stream directly to client
+- All S3 responses stream directly to client via TeeStream
 - Simultaneous caching in background
 - Eliminates buffering and memory pressure
 - Constant memory usage regardless of file size
@@ -155,7 +155,7 @@ src/
 **Problem**: Large files (500MB+) caused AWS SDK throughput timeouts when buffering entire response.
 
 **Solution**: TeeStream architecture
-- Responses > 1MB stream directly to client
+- All streaming S3 responses stream directly to client via TeeStream
 - Data simultaneously sent to background task for caching
 - No buffering of entire response in memory
 
