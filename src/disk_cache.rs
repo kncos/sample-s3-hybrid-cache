@@ -8070,12 +8070,13 @@ mod tests {
             .await;
         assert!(result.is_err(), "Should fail when start > end");
 
-        // Test data size mismatch
+        // Test data size mismatch (data larger than range)
+        // data is 1024 bytes but range 0-511 expects 512 bytes
         let result = cache_manager
             .store_range(
                 cache_key,
                 0,
-                2047,
+                511,
                 &data,
                 object_metadata,
                 std::time::Duration::from_secs(3600), true)

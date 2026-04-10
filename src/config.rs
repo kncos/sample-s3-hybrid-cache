@@ -206,6 +206,9 @@ pub struct ServerConfig {
     /// Enable adding Referer header for proxy identification in S3 Server Access Logs
     #[serde(default = "default_add_referer_header")]
     pub add_referer_header: bool,
+    /// Optional TLS proxy listener configuration
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 fn default_http_port() -> u16 {
@@ -227,6 +230,10 @@ fn default_add_referer_header() -> bool {
     true
 }
 
+fn default_tls_proxy_port() -> u16 {
+    8443
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -235,7 +242,60 @@ impl Default for ServerConfig {
             max_concurrent_requests: default_max_concurrent_requests(),
             request_timeout: default_request_timeout(),
             add_referer_header: default_add_referer_header(),
+            tls: None,
         }
+    }
+}
+
+/// TLS proxy listener configuration
+///
+/// Configures a TLS-terminating listener that decrypts client connections
+/// and feeds plaintext HTTP into the caching pipeline. Uses `tls_proxy_port`
+/// to distinguish from the existing `https_port` (TCP passthrough).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TlsConfig {
+    /// Whether the TLS proxy listener is active
+    #[serde(default)]
+    pub enabled: bool,
+    /// Port for the TLS proxy listener (default: 8443)
+    #[serde(default = "default_tls_proxy_port")]
+    pub tls_proxy_port: u16,
+    /// Path to PEM-encoded certificate chain file
+    #[serde(default)]
+    pub cert_path: String,
+    /// Path to PEM-encoded private key file
+    #[serde(default)]
+    pub key_path: String,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tls_proxy_port: default_tls_proxy_port(),
+            cert_path: String::new(),
+            key_path: String::new(),
+        }
+    }
+}
+
+impl TlsConfig {
+    /// Validate the TLS configuration.
+    /// When enabled, cert_path and key_path must be non-empty, and tls_proxy_port must not be 0.
+    /// Requirements: 6.2, 6.3
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.enabled {
+            if self.cert_path.is_empty() {
+                return Err("tls.cert_path must be non-empty when tls is enabled".to_string());
+            }
+            if self.key_path.is_empty() {
+                return Err("tls.key_path must be non-empty when tls is enabled".to_string());
+            }
+        }
+        if self.tls_proxy_port == 0 {
+            return Err("tls.tls_proxy_port must not be 0".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -1541,6 +1601,7 @@ impl Default for Config {
                 max_concurrent_requests: 200,
                 request_timeout: Duration::from_secs(30),
                 add_referer_header: true,
+                tls: None,
             },
             cache: CacheConfig {
                 cache_dir: PathBuf::from("/cache"),
@@ -1697,6 +1758,10 @@ impl Config {
                 e
             )));
         }
+
+        // Validate TLS configuration
+        // Requirements: 6.2, 6.3, 6.5
+        config.validate_tls_config()?;
 
         // Validate and clamp download coordination configuration
         config.cache.download_coordination.validate_and_clamp();
@@ -2340,6 +2405,42 @@ impl Config {
                 self.cache.shared_storage.eviction_lock_timeout = Duration::from_secs(timeout_secs);
             }
         }
+    }
+
+    /// Validate TLS proxy listener configuration.
+    /// Checks TlsConfig fields and ensures tls_proxy_port does not conflict with other ports.
+    /// Requirements: 6.2, 6.3, 6.5
+    fn validate_tls_config(&self) -> Result<()> {
+        if let Some(tls) = &self.server.tls {
+            if let Err(e) = tls.validate() {
+                return Err(ProxyError::ConfigError(format!(
+                    "Invalid TLS configuration: {}",
+                    e
+                )));
+            }
+
+            // Check port conflicts only when TLS is enabled
+            // Requirement: 6.5
+            if tls.enabled {
+                let port = tls.tls_proxy_port;
+                let conflicts: &[(&str, u16)] = &[
+                    ("http_port", self.server.http_port),
+                    ("https_port", self.server.https_port),
+                    ("health.port", self.health.port),
+                    ("metrics.port", self.metrics.port),
+                    ("dashboard.port", self.dashboard.port),
+                ];
+                for (name, other_port) in conflicts {
+                    if port == *other_port {
+                        return Err(ProxyError::ConfigError(format!(
+                            "tls.tls_proxy_port ({}) conflicts with {} ({})",
+                            port, name, other_port
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate and correct RAM cache flush configuration
@@ -4579,6 +4680,178 @@ metrics:
         let config: Config = serde_yaml::from_str(yaml).expect("Failed to parse config");
         assert_eq!(config.server.add_referer_header, false);
     }
+
+    // --- TLS config validation tests ---
+
+    #[test]
+    fn test_tls_config_validate_enabled_missing_cert_path() {
+        let tls = TlsConfig {
+            enabled: true,
+            tls_proxy_port: 8443,
+            cert_path: String::new(),
+            key_path: "/path/to/key.pem".to_string(),
+        };
+        let result = tls.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cert_path"));
+    }
+
+    #[test]
+    fn test_tls_config_validate_enabled_missing_key_path() {
+        let tls = TlsConfig {
+            enabled: true,
+            tls_proxy_port: 8443,
+            cert_path: "/path/to/cert.pem".to_string(),
+            key_path: String::new(),
+        };
+        let result = tls.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("key_path"));
+    }
+
+    #[test]
+    fn test_tls_config_validate_enabled_valid() {
+        let tls = TlsConfig {
+            enabled: true,
+            tls_proxy_port: 8443,
+            cert_path: "/path/to/cert.pem".to_string(),
+            key_path: "/path/to/key.pem".to_string(),
+        };
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tls_config_validate_disabled_empty_paths_ok() {
+        let tls = TlsConfig {
+            enabled: false,
+            tls_proxy_port: 8443,
+            cert_path: String::new(),
+            key_path: String::new(),
+        };
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tls_config_validate_port_zero_rejected() {
+        let tls = TlsConfig {
+            enabled: false,
+            tls_proxy_port: 0,
+            cert_path: String::new(),
+            key_path: String::new(),
+        };
+        let result = tls.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must not be 0"));
+    }
+
+    #[test]
+    fn test_tls_config_port_conflict_with_http_port() {
+        let mut config = Config::default();
+        config.server.tls = Some(TlsConfig {
+            enabled: true,
+            tls_proxy_port: config.server.http_port,
+            cert_path: "/cert.pem".to_string(),
+            key_path: "/key.pem".to_string(),
+        });
+        let result = config.validate_tls_config();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("http_port"));
+    }
+
+    #[test]
+    fn test_tls_config_port_conflict_with_https_port() {
+        let mut config = Config::default();
+        config.server.tls = Some(TlsConfig {
+            enabled: true,
+            tls_proxy_port: config.server.https_port,
+            cert_path: "/cert.pem".to_string(),
+            key_path: "/key.pem".to_string(),
+        });
+        let result = config.validate_tls_config();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("https_port"));
+    }
+
+    #[test]
+    fn test_tls_config_port_conflict_with_health_port() {
+        let mut config = Config::default();
+        config.server.tls = Some(TlsConfig {
+            enabled: true,
+            tls_proxy_port: config.health.port,
+            cert_path: "/cert.pem".to_string(),
+            key_path: "/key.pem".to_string(),
+        });
+        let result = config.validate_tls_config();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("health.port"));
+    }
+
+    #[test]
+    fn test_tls_config_port_conflict_with_metrics_port() {
+        let mut config = Config::default();
+        // Set metrics port to a unique value so it doesn't collide with health port
+        config.metrics.port = 9090;
+        config.server.tls = Some(TlsConfig {
+            enabled: true,
+            tls_proxy_port: 9090,
+            cert_path: "/cert.pem".to_string(),
+            key_path: "/key.pem".to_string(),
+        });
+        let result = config.validate_tls_config();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("metrics.port"));
+    }
+
+    #[test]
+    fn test_tls_config_port_conflict_with_dashboard_port() {
+        let mut config = Config::default();
+        config.server.tls = Some(TlsConfig {
+            enabled: true,
+            tls_proxy_port: config.dashboard.port,
+            cert_path: "/cert.pem".to_string(),
+            key_path: "/key.pem".to_string(),
+        });
+        let result = config.validate_tls_config();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("dashboard.port"));
+    }
+
+    #[test]
+    fn test_tls_config_unique_port_passes() {
+        let mut config = Config::default();
+        config.server.tls = Some(TlsConfig {
+            enabled: true,
+            tls_proxy_port: 9999,
+            cert_path: "/cert.pem".to_string(),
+            key_path: "/key.pem".to_string(),
+        });
+        assert!(config.validate_tls_config().is_ok());
+    }
+
+    #[test]
+    fn test_tls_config_none_passes() {
+        let config = Config::default();
+        assert!(config.validate_tls_config().is_ok());
+    }
+
+    #[test]
+    fn test_tls_config_disabled_skips_port_conflict_check() {
+        let mut config = Config::default();
+        config.server.tls = Some(TlsConfig {
+            enabled: false,
+            tls_proxy_port: config.server.http_port, // conflicts, but TLS is disabled
+            cert_path: String::new(),
+            key_path: String::new(),
+        });
+        // Port 0 check still applies
+        // But http_port (80) is not 0, so this should pass since enabled=false skips conflict check
+        assert!(config.validate_tls_config().is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -4795,3 +5068,188 @@ access_log_file_rotation_interval: "{}s"
     }
 }
 
+
+#[cfg(test)]
+mod tls_config_property_tests {
+    use super::*;
+    use quickcheck::{Arbitrary, Gen, TestResult};
+    use quickcheck_macros::quickcheck;
+
+    /// Generate a random alphanumeric string of length 1..=max_len.
+    fn random_nonempty_path(g: &mut Gen) -> String {
+        let len = usize::arbitrary(g) % 20 + 1; // 1..=20
+        (0..len)
+            .map(|_| {
+                let idx = usize::arbitrary(g) % 36;
+                if idx < 10 {
+                    (b'0' + idx as u8) as char
+                } else {
+                    (b'a' + (idx - 10) as u8) as char
+                }
+            })
+            .collect()
+    }
+
+    impl Arbitrary for TlsConfig {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let enabled = bool::arbitrary(g);
+            // Port in 1024..65535
+            let tls_proxy_port = (u16::arbitrary(g) % (65535 - 1024)) + 1024;
+            let (cert_path, key_path) = if enabled {
+                (random_nonempty_path(g), random_nonempty_path(g))
+            } else {
+                // When disabled, randomly choose empty or non-empty paths
+                let cert = if bool::arbitrary(g) {
+                    random_nonempty_path(g)
+                } else {
+                    String::new()
+                };
+                let key = if bool::arbitrary(g) {
+                    random_nonempty_path(g)
+                } else {
+                    String::new()
+                };
+                (cert, key)
+            };
+            TlsConfig {
+                enabled,
+                tls_proxy_port,
+                cert_path,
+                key_path,
+            }
+        }
+    }
+
+    /// **Feature: tls-proxy-listener, Property 5: TLS config round-trip serialization**
+    ///
+    /// *For any* valid `TlsConfig` (with `tls_proxy_port` in 1024..65535, non-empty
+    /// `cert_path` and `key_path` when enabled), serializing to YAML and deserializing
+    /// back SHALL produce an equivalent `TlsConfig`.
+    ///
+    /// **Validates: Requirements 6.1, 6.4**
+    #[quickcheck]
+    fn prop_tls_config_round_trip_serialization(config: TlsConfig) -> TestResult {
+        // Serialize to YAML
+        let yaml = match serde_yaml::to_string(&config) {
+            Ok(y) => y,
+            Err(_) => return TestResult::discard(),
+        };
+
+        // Deserialize back
+        let deserialized: TlsConfig = match serde_yaml::from_str(&yaml) {
+            Ok(c) => c,
+            Err(_) => return TestResult::failed(),
+        };
+
+        TestResult::from_bool(config == deserialized)
+    }
+
+    /// **Feature: tls-proxy-listener, Property 6: TLS config validation rejects invalid configurations**
+    ///
+    /// *For any* `TlsConfig` with `enabled = true`, validation SHALL reject the
+    /// configuration if `cert_path` is empty OR `key_path` is empty.
+    /// *For any* `TlsConfig` with `enabled = false`, validation SHALL accept the
+    /// configuration regardless of `cert_path` and `key_path` values.
+    ///
+    /// **Validates: Requirements 6.2, 6.3**
+    #[quickcheck]
+    fn prop_tls_config_validation_rejects_invalid(
+        enabled: bool,
+        use_empty_cert: bool,
+        use_empty_key: bool,
+    ) -> TestResult {
+        let cert_path = if use_empty_cert {
+            String::new()
+        } else {
+            "/some/cert.pem".to_string()
+        };
+        let key_path = if use_empty_key {
+            String::new()
+        } else {
+            "/some/key.pem".to_string()
+        };
+        // Use a valid non-zero port so port validation doesn't interfere
+        let config = TlsConfig {
+            enabled,
+            tls_proxy_port: 8443,
+            cert_path,
+            key_path,
+        };
+
+        let result = config.validate();
+
+        if !enabled {
+            // Disabled TLS always passes validation (regardless of paths)
+            TestResult::from_bool(result.is_ok())
+        } else if use_empty_cert || use_empty_key {
+            // Enabled with empty cert or key must be rejected
+            TestResult::from_bool(result.is_err())
+        } else {
+            // Enabled with both paths non-empty and valid port must be accepted
+            TestResult::from_bool(result.is_ok())
+        }
+    }
+
+    /// **Feature: tls-proxy-listener, Property 7: Port conflict detection**
+    ///
+    /// *For any* server configuration where `tls.tls_proxy_port` equals any of
+    /// `http_port`, `https_port`, `health.port`, `metrics.port`, or `dashboard.port`,
+    /// config validation SHALL reject the configuration. *For any* configuration where
+    /// `tls.tls_proxy_port` differs from all other ports, this check SHALL pass.
+    ///
+    /// **Validates: Requirements 6.5**
+    #[quickcheck]
+    fn prop_port_conflict_detection(
+        tls_port: u16,
+        http_port: u16,
+        https_port: u16,
+        health_port: u16,
+        metrics_port: u16,
+        dashboard_port: u16,
+        force_conflict: bool,
+        conflict_index: u8,
+    ) -> TestResult {
+        // Ensure tls_proxy_port is non-zero (port 0 is rejected by TlsConfig::validate)
+        let tls_port = if tls_port == 0 { 1 } else { tls_port };
+
+        let other_ports = [http_port, https_port, health_port, metrics_port, dashboard_port];
+
+        // Determine the actual tls_proxy_port to use
+        let tls_proxy_port = if force_conflict {
+            // Pick one of the other ports to create a guaranteed conflict
+            let idx = (conflict_index as usize) % other_ports.len();
+            let conflicting = other_ports[idx];
+            // If the chosen port is 0, discard (port 0 would fail TlsConfig::validate instead)
+            if conflicting == 0 {
+                return TestResult::discard();
+            }
+            conflicting
+        } else {
+            tls_port
+        };
+
+        let has_conflict = other_ports.iter().any(|&p| p == tls_proxy_port);
+
+        // Build a Config with these port values and TLS enabled with valid paths
+        let mut config = Config::default();
+        config.server.http_port = http_port;
+        config.server.https_port = https_port;
+        config.health.port = health_port;
+        config.metrics.port = metrics_port;
+        config.dashboard.port = dashboard_port;
+        config.server.tls = Some(TlsConfig {
+            enabled: true,
+            tls_proxy_port,
+            cert_path: "/cert.pem".to_string(),
+            key_path: "/key.pem".to_string(),
+        });
+
+        let result = config.validate_tls_config();
+
+        if has_conflict {
+            TestResult::from_bool(result.is_err())
+        } else {
+            TestResult::from_bool(result.is_ok())
+        }
+    }
+}

@@ -135,16 +135,6 @@ dashboard:
   max_log_entries: 50        # Reduced memory usage
 ```
 
-### Docker
-```yaml
-services:
-  s3-proxy:
-    ports:
-      - "80:80"
-      - "443:443"
-      - "8081:8081"  # Dashboard port
-```
-
 ## Troubleshooting
 
 ### Dashboard Not Accessible

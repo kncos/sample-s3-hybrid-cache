@@ -13,6 +13,7 @@ use s3_proxy::{
     orphaned_range_recovery::OrphanedRangeRecovery,
     permissions::PermissionValidator,
     shutdown::{ShutdownCoordinator, ShutdownSignal},
+    tls_proxy_listener::TlsProxyListener,
     Result,
 };
 use std::net::SocketAddr;
@@ -530,6 +531,46 @@ async fn main() -> Result<()> {
     // Subscribe shutdown signals for HTTP and HTTPS proxies before coordinator is moved
     let http_shutdown_rx = shutdown_coordinator.subscribe();
     let https_shutdown_rx = shutdown_coordinator.subscribe();
+
+    // Start TLS proxy listener if enabled
+    let _tls_task = if let Some(tls_config) = &config.server.tls {
+        if tls_config.enabled {
+            let tls_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], tls_config.tls_proxy_port));
+            match TlsProxyListener::new(
+                tls_addr,
+                &tls_config.cert_path,
+                &tls_config.key_path,
+                http_proxy.get_config(),
+                http_proxy.get_cache_manager(),
+                http_proxy.get_s3_client(),
+                http_proxy.get_range_handler(),
+                http_proxy.get_request_semaphore(),
+                http_proxy.get_active_connections(),
+                http_proxy.get_metrics_manager(),
+                http_proxy.get_logger_manager(),
+                http_proxy.get_inflight_tracker(),
+                http_proxy.get_proxy_referer(),
+            ) {
+                Ok(tls_listener) => {
+                    info!("TLS proxy port: {}", tls_config.tls_proxy_port);
+                    let tls_shutdown = ShutdownSignal::new(shutdown_coordinator.subscribe());
+                    Some(tokio::spawn(async move {
+                        if let Err(e) = tls_listener.start(tls_shutdown).await {
+                            error!("TLS proxy listener failed: {}", e);
+                        }
+                    }))
+                }
+                Err(e) => {
+                    error!("Failed to start TLS proxy listener: {}. HTTP/HTTPS proxies will continue.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Start dashboard server if enabled
     let _dashboard_task = if config.dashboard.enabled {

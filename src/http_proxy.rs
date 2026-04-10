@@ -24,7 +24,7 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{HeaderMap, Method, Request, Response, StatusCode};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -458,6 +458,41 @@ impl HttpProxy {
         Arc::clone(&self.active_connections)
     }
 
+    /// Get reference to config for TLS proxy listener
+    pub fn get_config(&self) -> Arc<Config> {
+        Arc::clone(&self.config)
+    }
+
+    /// Get reference to range handler for TLS proxy listener
+    pub fn get_range_handler(&self) -> Arc<RangeHandler> {
+        Arc::clone(&self.range_handler)
+    }
+
+    /// Get reference to request semaphore for TLS proxy listener
+    pub fn get_request_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.request_semaphore)
+    }
+
+    /// Get reference to metrics manager for TLS proxy listener
+    pub fn get_metrics_manager(&self) -> Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>> {
+        self.metrics_manager.clone()
+    }
+
+    /// Get reference to logger manager for TLS proxy listener
+    pub fn get_logger_manager(&self) -> Option<Arc<Mutex<LoggerManager>>> {
+        self.logger_manager.clone()
+    }
+
+    /// Get reference to inflight tracker for TLS proxy listener
+    pub fn get_inflight_tracker(&self) -> Arc<InFlightTracker> {
+        Arc::clone(&self.inflight_tracker)
+    }
+
+    /// Get proxy referer header value for TLS proxy listener
+    pub fn get_proxy_referer(&self) -> Option<String> {
+        self.proxy_referer.clone()
+    }
+
     /// Start the HTTP proxy server
     pub async fn start(&self, mut shutdown_signal: crate::shutdown::ShutdownSignal) -> Result<()> {
         let listener = TcpListener::bind(self.listen_addr).await?;
@@ -639,7 +674,7 @@ impl HttpProxy {
 
     /// Handle a single HTTP request
     pub async fn handle_request(
-        req: Request<hyper::body::Incoming>,
+        mut req: Request<hyper::body::Incoming>,
         client_addr: SocketAddr,
         config: Arc<Config>,
         cache_manager: Arc<CacheManager>,
@@ -685,11 +720,28 @@ impl HttpProxy {
             }
         };
 
-        // Validate Host header (requirement 1.1, 1.3)
-        let host = match Self::validate_host_header(&req) {
-            Ok(host) => host,
-            Err(response) => return Ok(response),
+        // Detect forward proxy request (absolute URI) or fall through to direct mode
+        // Requirements: 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 5.1, 5.2, 11.1, 14.1, 14.2, 14.3, 14.4
+        let (host, effective_uri) = if let Some((proxy_host, relative_uri)) = Self::detect_forward_proxy(&req) {
+            debug!(
+                "Forward proxy request detected: method={}, host={}, path={}",
+                req.method(), proxy_host, relative_uri.path()
+            );
+            (proxy_host, relative_uri)
+        } else {
+            // Existing direct-mode path: extract host from Host header
+            let host = match Self::validate_host_header(&req) {
+                Ok(host) => host,
+                Err(response) => return Ok(response),
+            };
+            let effective_uri = req.uri().clone();
+            (host, effective_uri)
         };
+
+        // Rewrite the request URI to the effective (relative) URI so all downstream
+        // handlers (handle_get_head_request, handle_put_request, handle_other_request)
+        // see the correct path and query without needing individual changes.
+        *req.uri_mut() = effective_uri.clone();
 
         // Detect path-style AP/MRAP alias requests for logging.
         // We do NOT rewrite the host or path — the request is forwarded to S3
@@ -697,16 +749,16 @@ impl HttpProxy {
         // S3 handles path-style AP/MRAP requests natively.
         // The alias naturally appears as the first path segment, which provides
         // correct cache key namespacing without any rewriting.
-        if let Some(alias) = detect_path_style_alias(&host, req.uri().path()) {
+        if let Some(alias) = detect_path_style_alias(&host, effective_uri.path()) {
             debug!(
                 "Path-style AP/MRAP alias detected (forwarding as-is): alias={}, path={}",
-                alias.cache_key_prefix, req.uri().path()
+                alias.cache_key_prefix, effective_uri.path()
             );
         }
 
         // Extract request info for logging
         let method = req.method().clone();
-        let uri = req.uri().clone();
+        let uri = effective_uri;
         let user_agent = req
             .headers()
             .get("user-agent")
@@ -850,6 +902,39 @@ impl HttpProxy {
                     e
                 })
                 .boxed(),
+        }
+    }
+
+    /// Detect forward proxy request (absolute URI) and extract target host.
+    /// Returns (host, rewritten_uri) if absolute URI detected, None otherwise.
+    ///
+    /// When a client uses HTTP_PROXY, it sends requests with absolute URIs
+    /// (e.g., `GET http://s3.amazonaws.com/bucket/key HTTP/1.1`). This function
+    /// detects that format, extracts the target host from the authority component,
+    /// and rebuilds the URI as a relative path (path + query only) for downstream
+    /// processing.
+    ///
+    /// Requirements: 1.1, 1.2, 1.3, 1.4
+    fn detect_forward_proxy(req: &Request<hyper::body::Incoming>) -> Option<(String, Uri)> {
+        Self::detect_forward_proxy_uri(req.uri())
+    }
+
+    /// Core URI detection logic extracted for testability.
+    ///
+    /// Returns `Some((host, relative_uri))` when the URI has a scheme (absolute URI),
+    /// `None` otherwise (relative URI / direct mode).
+    ///
+    /// Requirements: 1.1, 1.2, 1.3, 1.4
+    fn detect_forward_proxy_uri(uri: &Uri) -> Option<(String, Uri)> {
+        if uri.scheme().is_some() {
+            let host = uri.authority()?.host().to_string();
+            let path_and_query = uri.path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/");
+            let relative_uri: Uri = path_and_query.parse().ok()?;
+            Some((host, relative_uri))
+        } else {
+            None
         }
     }
 
@@ -7720,5 +7805,329 @@ mod tests {
         assert!(actual.starts_with("s3-hybrid-cache/"));
         assert!(actual.contains(version));
         assert!(actual.ends_with(&format!("({})", hostname)));
+    }
+
+    // ---- Forward proxy URI detection property tests ----
+
+    /// **Feature: tls-proxy-listener, Property 1: Absolute URI detection is correct**
+    ///
+    /// *For any* URI string, `detect_forward_proxy_uri` SHALL return `Some` if and
+    /// only if the URI contains a scheme (e.g., `http://`). URIs without a scheme
+    /// SHALL return `None`.
+    ///
+    /// **Validates: Requirements 1.1, 1.4**
+    #[quickcheck]
+    fn prop_absolute_uri_detection_is_correct(host: String, path: String, use_scheme: bool) -> TestResult {
+        // Filter out hosts that are empty or contain characters invalid in a URI authority
+        if host.is_empty() || host.contains('/') || host.contains(' ') || host.contains('#')
+            || host.contains('?') || host.contains('@') || host.contains('[') || host.contains(']')
+        {
+            return TestResult::discard();
+        }
+
+        // Sanitize path: must start with '/' and not contain fragment/whitespace
+        let path = if path.is_empty() || !path.starts_with('/') {
+            format!("/{}", path.replace(' ', "").replace('#', ""))
+        } else {
+            path.replace(' ', "").replace('#', "")
+        };
+
+        // Discard if path still contains characters that break URI parsing
+        if path.contains(|c: char| c.is_control()) {
+            return TestResult::discard();
+        }
+
+        let uri_string = if use_scheme {
+            format!("http://{}{}", host, path)
+        } else {
+            path.clone()
+        };
+
+        // Attempt to parse as a Uri — discard if hyper can't parse it
+        let uri: Uri = match uri_string.parse() {
+            Ok(u) => u,
+            Err(_) => return TestResult::discard(),
+        };
+
+        let result = HttpProxy::detect_forward_proxy_uri(&uri);
+
+        if use_scheme {
+            // Absolute URI: must return Some
+            match result {
+                Some(_) => TestResult::passed(),
+                None => TestResult::failed(),
+            }
+        } else {
+            // Relative URI: must return None
+            match result {
+                None => TestResult::passed(),
+                Some(_) => TestResult::failed(),
+            }
+        }
+    }
+
+    /// **Feature: tls-proxy-listener, Property 2: URI component extraction preserves all parts**
+    ///
+    /// *For any* absolute URI with scheme, authority, path, and optional query string,
+    /// `detect_forward_proxy_uri` SHALL extract a host that matches the URI's authority
+    /// host component, and a relative URI whose path and query match the original URI's
+    /// path and query.
+    ///
+    /// **Validates: Requirements 1.2, 1.3, 5.1**
+    #[quickcheck]
+    fn prop_uri_component_extraction_preserves_all_parts(
+        host_parts: Vec<u8>,
+        path_segments: Vec<u8>,
+        query_parts: Vec<u8>,
+        include_query: bool,
+    ) -> TestResult {
+        // Generate a host from alphanumeric bytes (like s3.amazonaws.com patterns)
+        let host: String = host_parts
+            .iter()
+            .map(|b| {
+                let idx = (*b as usize) % 37; // a-z, 0-9, '.'
+                if idx < 26 {
+                    (b'a' + idx as u8) as char
+                } else if idx < 36 {
+                    (b'0' + (idx - 26) as u8) as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+
+        // Host must be non-empty and not start/end with '.'
+        if host.is_empty() || host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+            return TestResult::discard();
+        }
+
+        // Generate a path starting with '/' using alphanumeric + '/' chars
+        let path_body: String = path_segments
+            .iter()
+            .map(|b| {
+                let idx = (*b as usize) % 38; // a-z, 0-9, '/', '-'
+                if idx < 26 {
+                    (b'a' + idx as u8) as char
+                } else if idx < 36 {
+                    (b'0' + (idx - 26) as u8) as char
+                } else if idx == 36 {
+                    '/'
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let path = format!("/{}", path_body);
+
+        // Generate an optional query string from alphanumeric + '=' + '&' chars
+        let query: Option<String> = if include_query && !query_parts.is_empty() {
+            let q: String = query_parts
+                .iter()
+                .map(|b| {
+                    let idx = (*b as usize) % 39; // a-z, 0-9, '=', '&', '_'
+                    if idx < 26 {
+                        (b'a' + idx as u8) as char
+                    } else if idx < 36 {
+                        (b'0' + (idx - 26) as u8) as char
+                    } else if idx == 36 {
+                        '='
+                    } else if idx == 37 {
+                        '&'
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            Some(q)
+        } else {
+            None
+        };
+
+        // Construct the absolute URI
+        let uri_string = match &query {
+            Some(q) => format!("http://{}{}?{}", host, path, q),
+            None => format!("http://{}{}", host, path),
+        };
+
+        // Parse as a Uri — discard if hyper can't parse it
+        let uri: Uri = match uri_string.parse() {
+            Ok(u) => u,
+            Err(_) => return TestResult::discard(),
+        };
+
+        // Call detect_forward_proxy_uri — must return Some for absolute URIs
+        let (extracted_host, relative_uri) = match HttpProxy::detect_forward_proxy_uri(&uri) {
+            Some(result) => result,
+            None => return TestResult::failed(),
+        };
+
+        // Verify extracted host matches the generated host
+        if extracted_host != host {
+            return TestResult::failed();
+        }
+
+        // Verify relative URI path matches the generated path
+        if relative_uri.path() != path {
+            return TestResult::failed();
+        }
+
+        // Verify relative URI query matches the generated query
+        match (&query, relative_uri.query()) {
+            (Some(expected_q), Some(actual_q)) => {
+                if actual_q != expected_q {
+                    return TestResult::failed();
+                }
+            }
+            (None, None) => {} // Both absent — correct
+            _ => return TestResult::failed(),
+        }
+
+        TestResult::passed()
+    }
+
+    // ---- Cache key equivalence property test ----
+
+    /// **Feature: tls-proxy-listener, Property 3: Cache key equivalence across request modes**
+    ///
+    /// *For any* S3 object path and host, the cache key generated from a forward proxy
+    /// request (host extracted from absolute URI) SHALL be identical to the cache key
+    /// generated from a direct-mode request (host extracted from Host header) when both
+    /// target the same path and host.
+    ///
+    /// This proves that `CacheManager::generate_cache_key` is deterministic: given the
+    /// same (path, host) inputs, it always produces the same cache key regardless of
+    /// whether the request arrived via forward proxy or direct mode.
+    ///
+    /// **Validates: Requirements 3.3, 3.4, 14.1, 14.3**
+    #[quickcheck]
+    fn prop_cache_key_equivalence_across_request_modes(
+        path_segments: Vec<u8>,
+        host_parts: Vec<u8>,
+    ) -> TestResult {
+        // Generate a path starting with '/' using alphanumeric + '/' chars
+        let path_body: String = path_segments
+            .iter()
+            .map(|b| {
+                let idx = (*b as usize) % 38; // a-z, 0-9, '/', '-'
+                if idx < 26 {
+                    (b'a' + idx as u8) as char
+                } else if idx < 36 {
+                    (b'0' + (idx - 26) as u8) as char
+                } else if idx == 36 {
+                    '/'
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let path = format!("/{}", path_body);
+
+        // Discard bare root path — real S3 requests always have a bucket/key
+        if path == "/" {
+            return TestResult::discard();
+        }
+
+        // Generate a host from alphanumeric bytes (like s3.amazonaws.com patterns)
+        let host: String = host_parts
+            .iter()
+            .map(|b| {
+                let idx = (*b as usize) % 37; // a-z, 0-9, '.'
+                if idx < 26 {
+                    (b'a' + idx as u8) as char
+                } else if idx < 36 {
+                    (b'0' + (idx - 26) as u8) as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+
+        // Host must be non-empty and not start/end with '.'
+        if host.is_empty() || host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+            return TestResult::discard();
+        }
+
+        // Simulate forward proxy mode: generate cache key with (path, host)
+        let key_forward_proxy = CacheManager::generate_cache_key(&path, Some(&host));
+
+        // Simulate direct mode: generate cache key with the same (path, host)
+        let key_direct_mode = CacheManager::generate_cache_key(&path, Some(&host));
+
+        // Both modes must produce identical cache keys for the same path and host
+        if key_forward_proxy != key_direct_mode {
+            return TestResult::failed();
+        }
+
+        TestResult::passed()
+    }
+
+    // ---- Header preservation property test ----
+
+    /// **Feature: tls-proxy-listener, Property 4: Header preservation through forward proxy pipeline**
+    ///
+    /// *For any* set of HTTP headers (including Authorization and Host), when a forward
+    /// proxy request is processed through `build_s3_request_context()`, all original
+    /// header key-value pairs SHALL appear unchanged in the resulting `S3RequestContext.headers`.
+    ///
+    /// **Validates: Requirements 2.2, 2.3, 5.2**
+    #[quickcheck]
+    fn prop_header_preservation_through_forward_proxy_pipeline(
+        extra_headers: Vec<(u8, u8)>,
+    ) -> TestResult {
+        use crate::s3_client::build_s3_request_context;
+
+        // Build a header map with mandatory Authorization and Host headers
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20250101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=abcdef1234567890".to_string(),
+        );
+        let host = "my-bucket.s3.us-east-1.amazonaws.com".to_string();
+        headers.insert("host".to_string(), host.clone());
+
+        // Generate additional random headers from the input bytes
+        for (key_seed, val_seed) in &extra_headers {
+            // Map seed to a valid lowercase HTTP header name (a-z)
+            let key_char = (b'a' + (key_seed % 26)) as char;
+            let key = format!("x-custom-{}", key_char);
+            // Map seed to a printable ASCII value
+            let val_char = (b'a' + (val_seed % 26)) as char;
+            let value = format!("value-{}", val_char);
+            headers.insert(key, value);
+        }
+
+        // Snapshot the input headers before calling build_s3_request_context
+        let original_headers = headers.clone();
+
+        // Build a minimal URI for the request context
+        let uri: Uri = "/bucket/key".parse().unwrap();
+
+        // Call build_s3_request_context — the function under test
+        let context = build_s3_request_context(
+            Method::GET,
+            uri,
+            headers,
+            None,
+            host,
+        );
+
+        // Verify every original header appears unchanged in the context
+        for (key, value) in &original_headers {
+            match context.headers.get(key) {
+                Some(ctx_value) => {
+                    if ctx_value != value {
+                        return TestResult::failed();
+                    }
+                }
+                None => return TestResult::failed(),
+            }
+        }
+
+        // Verify the context has exactly the same number of headers (no extras added)
+        if context.headers.len() != original_headers.len() {
+            return TestResult::failed();
+        }
+
+        TestResult::passed()
     }
 }

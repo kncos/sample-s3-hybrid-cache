@@ -22,6 +22,22 @@ server:
   # Format: s3-hybrid-cache/{version} ({hostname})
   add_referer_header: true
 
+  # TLS Proxy Listener Configuration
+  # Terminates TLS using the proxy's own certificate, then processes decrypted HTTP
+  # through the caching pipeline. Use with HTTP_PROXY=https://proxy-host:8443.
+  # Note: tls_proxy_port is distinct from https_port — https_port is TCP passthrough
+  # (no caching), while tls_proxy_port terminates TLS and enables full caching.
+  tls:
+    # Whether the TLS proxy listener is active (default: false)
+    enabled: false
+    # Port for the TLS proxy listener (default: 8443)
+    # Named tls_proxy_port to distinguish from https_port which is TCP passthrough
+    tls_proxy_port: 8443
+    # Path to PEM-encoded certificate chain file
+    cert_path: "/etc/proxy/tls/cert.pem"
+    # Path to PEM-encoded private key file
+    key_path: "/etc/proxy/tls/key.pem"
+
 cache:
   cache_dir: "./tmp/cache"  # Local development; use absolute path for production (e.g., "/mnt/cache")
   max_cache_size: 524288000  # 500MB in bytes

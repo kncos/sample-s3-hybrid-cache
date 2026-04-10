@@ -49,6 +49,7 @@ fn create_test_config() -> Config {
             max_concurrent_requests: 100,
             request_timeout: Duration::from_secs(30),
             add_referer_header: true,
+            tls: None,
         },
         cache: CacheConfig {
             cache_dir: PathBuf::from("/tmp/s3_proxy_integration_test"),

@@ -39,30 +39,32 @@ Technical architecture overview and design principles for S3 Proxy.
 ## System Architecture
 
 ```
-    ┌─────────────────────┐              ┌─────────────────────┐
-    │   S3 Client (HTTP)  │              │  S3 Client (HTTPS)  │
-    │   - AWS CLI         │              │   - AWS CLI         │
-    │   - S3 SDK          │              │   - S3 SDK          │
-    └──────────┬──────────┘              └──────────┬──────────┘
-               │                                    │
-               ▼                                    ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                       S3 Proxy (1..N)                            │
-│  ┌───────────────────────────┐    ┌───────────────────────────┐  │
-│  │   HTTP Handler (Port 80)  │    │  HTTPS Handler (Port 443) │  │
-│  │   - Caching               │    │   - TCP Passthrough       │  │
-│  │   - Range Merging         │    │   - No Caching            │  │
-│  │   - Streaming             │    │   - Direct to S3          │  │
-│  └─────────────┬─────────────┘    └─────────────┬─────────────┘  │
-│                │                                │                │
-│                ▼                                │                │
-│  ┌───────────────────────────┐                  │                │
-│  │        RAM Cache          │                  │                │
-│  │   - Metadata + ranges     │                  │                │
-│  │   - Compression           │                  │                │
-│  │   - Eviction              │                  │                │
-│  └─────────────┬─────────────┘                  │                │
-└────────────────┼────────────────────────────────┼────────────────┘
+ ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+ │  S3 Client (HTTP)    │  │ S3 Client (HTTP_PROXY)│  │  S3 Client (HTTPS)  │
+ │  - DNS/hosts routing │  │ - HTTP_PROXY=https:// │  │  - Default HTTPS    │
+ │  - AWS CLI / SDK     │  │ - AWS CLI / SDK       │  │  - AWS CLI / SDK    │
+ └──────────┬───────────┘  └──────────┬────────────┘  └──────────┬──────────┘
+            │                         │                          │
+            ▼                         ▼                          ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                          S3 Proxy (1..N)                                   │
+│                                                                            │
+│  ┌────────────────────┐ ┌─────────────────────┐ ┌───────────────────────┐  │
+│  │ HTTP (Port 80)     │ │ TLS Proxy (Port 8443)│ │ HTTPS (Port 443)     │  │
+│  │ - Caching          │ │ - TLS Termination    │ │ - TCP Passthrough    │  │
+│  │ - Range Merging    │ │ - Caching            │ │ - No Caching         │  │
+│  │ - Streaming        │ │ - Range Merging      │ │ - Direct to S3       │  │
+│  └────────┬───────────┘ └──────────┬──────────┘ └───────────┬───────────┘  │
+│           │                        │                        │              │
+│           └────────────┬───────────┘                        │              │
+│                        ▼                                    │              │
+│           ┌───────────────────────────┐                     │              │
+│           │        RAM Cache          │                     │              │
+│           │   - Metadata + ranges     │                     │              │
+│           │   - Compression           │                     │              │
+│           │   - Eviction              │                     │              │
+│           └─────────────┬─────────────┘                     │              │
+└─────────────────────────┼───────────────────────────────────┼──────────────┘
                  │                                │
                  ▼                                │
 ┌───────────────────────────────┐                 │
@@ -416,11 +418,14 @@ Each instance operates independently - the shared storage is the only integratio
 
 ### Network Security Requirements
 
-**HTTP Traffic is Unencrypted**: All communication between clients and the proxy uses HTTP (port 80) for caching functionality. This means:
+**HTTP Traffic is Unencrypted**: Communication between clients and the HTTP listener (port 80) uses plaintext HTTP. This applies to both DNS-routed traffic and forward proxy traffic (`HTTP_PROXY=http://proxy:80`). This means:
 
 - **Trusted Network Required**: Deploy only in secured network environments (VPCs, internal networks, isolated subnets)
-- **Data in Transit**: S3 data flows unencrypted between client and proxy (proxy-to-S3 communication always uses HTTPS)
+- **Data in Transit**: S3 data flows unencrypted between client and proxy on port 80 (proxy-to-S3 communication always uses HTTPS)
 - **Network Controls**: Use security groups, firewalls, or network segmentation to restrict proxy access to authorized clients only
+- **Encrypted Alternative**: The TLS proxy listener (port 8443) terminates TLS using the proxy's own certificate, providing encrypted client-to-proxy traffic with full caching. Clients use `HTTP_PROXY=https://proxy:8443` with `--endpoint-url http://s3.region.amazonaws.com`. See [Getting Started](GETTING_STARTED.md) for configuration details.
+
+**TLS Certificate Management**: When TLS is enabled, the proxy loads a certificate and private key from paths specified in the config. For multi-instance deployments with shared storage, store the certificate and key on the shared volume alongside the configuration (e.g., `/mnt/nfs/config/tls/cert.pem` and `/mnt/nfs/config/tls/key.pem`) so all instances use the same certificate. Restrict file permissions on the private key (`chmod 600`). The certificate's Subject Alternative Names (SANs) must match how clients connect — use `IP:` SANs for direct IP connections, or `DNS:` SANs when clients connect through a load balancer or DNS name.
 
 ### Shared Cache Access Model
 

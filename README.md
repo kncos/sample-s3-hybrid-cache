@@ -32,6 +32,7 @@ S3 Hybrid Cache provides an intelligent caching layer that accelerates performan
 - HEAD response caching reduces metadata lookup latency for tools like Mountpoint for Amazon S3
 - Streaming architecture for large files—no buffering or throughput degradation
 - HTTPS passthrough for clients that cannot be configured for HTTP (only HTTP requests use the cache)
+- Optional TLS proxy listener for encrypted client-to-proxy traffic with full caching via `HTTP_PROXY`
 
 **Reduce Data Transfer Costs**
 - Serve cached content locally instead of fetching from S3 repeatedly
@@ -91,57 +92,66 @@ sudo cargo run --release -- -c config/config.example.yaml
 
 **Tip**: Set `AWS_ENDPOINT_URL_S3=http://s3.<region>.amazonaws.com` to automatically route AWS CLI S3 traffic through the proxy for buckets in that region. DNS zones are preferable to hosts file entries - see the [limitations and details](docs/GETTING_STARTED.md#3-configure-dns-routing).
 
+**Alternative: HTTP_PROXY routing** — Instead of DNS routing, you can point clients at the proxy using the `HTTP_PROXY` environment variable. This avoids DNS or hosts file changes entirely and works well for single-instance deployments. With the optional TLS proxy listener enabled, use `HTTP_PROXY=https://proxy-host:8443` for encrypted client-to-proxy traffic with full caching. See the [Getting Started Guide](docs/GETTING_STARTED.md) for configuration details.
+
 **Next Steps**: See [Getting Started Guide](docs/GETTING_STARTED.md) for detailed installation and configuration.
 
 ## Architecture
 
 ```
-      ┌─────────────────────┐       ┌─────────────────────┐
-      │  S3 Client (HTTP)   │       │  S3 Client (HTTPS)  │
-      │  - AWS CLI          │       │  - AWS CLI          │
-      │  - S3 SDK           │       │  - S3 SDK           │
-      └──────────┬──────────┘       └──────────┬──────────┘
-                 │                             │
-                 ▼                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        S3 Hybrid Cache (1..N)                   │
-│  ┌───────────────────────────┐  ┌───────────────────────────┐   │
-│  │  HTTP Handler (Port 80)   │  │ HTTPS Handler (Port 443)  │   │
-│  │  - Caching                │  │ - TCP Passthrough         │   │
-│  │  - Range Merging          │  │ - No Caching              │   │
-│  │  - Streaming              │  │ - Direct to S3            │   │
-│  └─────────────┬─────────────┘  └────────────┬──────────────┘   │
-│                │                             │                  │
-│                ▼                             │                  │
-│  ┌───────────────────────────┐               │                  │
-│  │        RAM Cache          │               │                  │
-│  │  - Metadata + ranges      │               │                  │
-│  │  - Compression            │               │                  │
-│  │  - Eviction               │               │                  │
-│  └─────────────┬─────────────┘               │                  │
-└────────────────┼─────────────────────────────┼──────────────────┘
-                 │                             │
-                 ▼                             │
-┌───────────────────────────────┐              │
-│   Shared Disk Cache (NFS)     │              │
-│  - Metadata + ranges          │              │
-│  - Compression                │              │
-│  - LRU/TinyLFU-like eviction  │              │
-│  - Fixed or elastic size      │              │
-│  - Journaled writes           │              │
-└───────────────┬───────────────┘              │
-                │                              │
-                └────────────────┬─────────────┘
-                                 │
-                                 ▼
-                   ┌─────────────────────────┐
-                   │    Amazon S3 (HTTPS)    │
-                   └─────────────────────────┘
+ ┌──────────────────────┐  ┌───────────────────────┐  ┌─────────────────────┐
+ │  S3 Client (HTTP)    │  │ S3 Client (HTTP_PROXY)│  │  S3 Client (HTTPS)  │
+ │  - DNS/hosts routing │  │ - HTTP_PROXY=https:// │  │  - Default HTTPS    │
+ │  - AWS CLI / SDK     │  │ - AWS CLI / SDK       │  │  - AWS CLI / SDK    │
+ └──────────┬───────────┘  └──────────┬────────────┘  └──────────┬──────────┘
+            │                         │                          │
+            ▼                         ▼                          ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                        S3 Hybrid Cache (1..N)                              │
+│                                                                            │
+│  ┌────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐  │
+│  │ HTTP (Port 80)     │ │ TLS Proxy (Port 8443)│ │ HTTPS (Port 443)     │  │
+│  │ - Caching          │ │ - TLS Termination    │ │ - TCP Passthrough    │  │
+│  │ - Range Merging    │ │ - Caching            │ │ - No Caching         │  │
+│  │ - Streaming        │ │ - Range Merging      │ │ - Direct to S3       │  │
+│  └────────┬───────────┘ └──────────┬───────────┘ └──────────┬───────────┘  │
+│           │                        │                        │              │
+│           └────────────┬───────────┘                        │              │
+│                        ▼                                    │              │
+│           ┌───────────────────────────┐                     │              │
+│           │        RAM Cache          │                     │              │
+│           │  - Metadata + ranges      │                     │              │
+│           │  - Compression            │                     │              │
+│           │  - Eviction               │                     │              │
+│           └─────────────┬─────────────┘                     │              │
+└─────────────────────────┼───────────────────────────────────┼──────────────┘
+                          │                                   │
+                          ▼                                   │
+           ┌───────────────────────────────┐                  │
+           │   Shared Disk Cache (NFS)     │                  │
+           │  - Metadata + ranges          │                  │
+           │  - Compression                │                  │
+           │  - LRU/TinyLFU-like eviction  │                  │
+           │  - Fixed or elastic size      │                  │
+           │  - Journaled writes           │                  │
+           └───────────────┬───────────────┘                  │
+                           │                                  │
+                           └────────────────┬─────────────────┘
+                                            │
+                                            ▼
+                              ┌─────────────────────────┐
+                              │    Amazon S3 (HTTPS)    │
+                              └─────────────────────────┘
 ```
+
+Routing methods:
+- **DNS routing**: Configure DNS or `/etc/hosts` to resolve S3 hostnames to the proxy. Supports multi-instance HA with multi-value DNS.
+- **HTTP_PROXY**: Set `HTTP_PROXY=https://proxy:8443` (recommended) to route traffic via the proxy with TLS encryption and full caching. Also works unencrypted with `HTTP_PROXY=http://proxy:80` on private networks. No DNS changes required. HA is possible by placing a load balancer in front of multiple proxy instances (as HTTP_PROXY does not support multi-value DNS), but this is outside the scope of this solution.
 
 Endpoints:
 - **HTTP (Port 80)**: Full caching with range optimization
 - **HTTPS (Port 443)**: TCP passthrough (no caching)
+- **TLS Proxy (Port 8443)**: TLS termination with full caching (for `HTTP_PROXY` clients)
 - **Health**: `localhost:8080/health`
 - **Metrics**: `localhost:9090/metrics`
 - **Dashboard**: `localhost:8081`
@@ -156,7 +166,7 @@ Endpoints:
 
 **Per-request authorization (TTL=0)**: For environments requiring per-request IAM authorization, [set TTL to zero](docs/ARCHITECTURE.md#shared-cache-access-model). Every request revalidates with S3 via conditional headers — bandwidth savings from 304 responses, with full IAM enforcement on every access.
 
-**HTTPS**: Supported only for [passthrough](#architecture) (TCP tunneling to S3). AWS CLI and SDKs use HTTPS by default, so all requests are authenticated by S3 unless clients explicitly opt into HTTP endpoints for caching. All proxy-to-S3 communication uses HTTPS regardless of client connection protocol. See the [FAQ](#faq) below for why caching requires HTTP.
+**HTTPS**: The HTTPS listener (port 443) provides [passthrough](#architecture) only (TCP tunneling to S3, no caching). For encrypted client-to-proxy traffic with caching, use the TLS proxy listener (port 8443) with `HTTP_PROXY`. AWS CLI and SDKs use HTTPS by default, so all requests are authenticated by S3 unless clients explicitly opt into HTTP endpoints or `HTTP_PROXY` routing for caching. All proxy-to-S3 communication uses HTTPS regardless of client connection protocol.
 
 See [Security Considerations](docs/ARCHITECTURE.md#security-considerations) for detailed guidance on the shared cache access model, deployment guidelines, and appropriate use cases.
 
@@ -202,7 +212,7 @@ Warm cache delivered 22% higher throughput and 2.4× lower p95 latency than dire
 
 **Q: Why HTTP instead of HTTPS for caching?**
 
-A: The proxy cannot present a trusted certificate for the S3 endpoint, so it cannot terminate TLS or inspect the traffic — only relay encrypted bytes. Caching would require TLS interception with a custom CA trusted by all clients. The proxies run inside the user's secure network, where encryption-in-transit between client and proxy may be unnecessary. All proxy-to-S3 communication uses HTTPS encryption. `HTTPS_PROXY` support was considered, but this would not help as it uses the HTTP CONNECT method to create a tunnel, and the client performs a TLS handshake with the destination (S3) through that tunnel. Additionally, `HTTPS_PROXY` routes through a single proxy address without multi-value DNS support, preventing load balancing and failover.
+A: The HTTP listener (port 80) uses plaintext HTTP so the proxy can read and cache request/response content. The HTTPS listener (port 443) uses TCP passthrough because the proxy cannot present a trusted certificate for the S3 endpoint — it can only relay encrypted bytes. For encrypted client-to-proxy traffic with caching, the optional TLS proxy listener (port 8443) terminates TLS using the proxy's own certificate, then processes the decrypted HTTP through the caching pipeline. Clients use `HTTP_PROXY=https://proxy:8443` with `--endpoint-url http://s3.region.amazonaws.com` — the SDK signs against the real S3 hostname at the HTTP level, and the proxy decrypts, caches, and forwards to S3 over HTTPS. All proxy-to-S3 communication uses HTTPS regardless of client connection protocol.
 
 **Q: How does load balancing and failover work?**
 
