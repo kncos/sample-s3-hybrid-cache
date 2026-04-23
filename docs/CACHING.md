@@ -32,6 +32,7 @@
 - [Compression](#compression)
 - [Multi-Instance Caching](#multi-instance-caching)
 - [Cache Access Tracking](#cache-access-tracking)
+  - [Journal-Based Metadata Updates (Shared Storage)](#journal-based-metadata-updates-shared-storage)
 - [Distributed Eviction Coordination](#distributed-eviction-coordination)
 - [Range-Based Disk Cache Eviction](#range-based-disk-cache-eviction)
 - [Monitoring](#monitoring)

@@ -52,6 +52,7 @@ S3 Hybrid Cache provides an intelligent caching layer that accelerates performan
 - Horizontal scaling with coordinated cache access across instances
 - No single point of failure—any instance can serve cached content
 - Stateless instances—no direct communication between nodes; all coordination via shared storage makes instances ephemeral and replaceable
+- Journal-based metadata updates—each instance writes cache updates to its own journal file, and a background consolidator merges them atomically, eliminating race conditions on shared storage without inter-node communication
 - Content-aware LZ4 compression—2-10x space savings, automatically skips already-compressed formats
 - Per-bucket and per-prefix cache settings—configure TTLs, read/write caching, compression, and RAM cache eligibility per bucket via JSON files, with hot reload
 - Flexible expiration modes—lazy (fixed capacity) or active (elastic storage)
