@@ -395,6 +395,8 @@ Each instance operates independently - the shared storage is the only integratio
 - Missing parts trigger cleanup without affecting other uploads
 - Prevents incomplete cache entries that could serve corrupted data
 
+For the full multipart upload state machine, correctness gates, concurrency semantics, and threat model see [MULTIPART_UPLOAD.md](MULTIPART_UPLOAD.md).
+
 ## Performance Characteristics
 
 ### Latency
@@ -493,6 +495,30 @@ This is an inherent limitation of the S3 API design, not a proxy implementation 
 - **Metadata Exposure**: Object keys, sizes, and access patterns visible in cache metadata
 - **File System Access**: Anyone with file system access can read cached data directly
 - **Encryption at Rest**: Use storage-level encryption if encryption at rest is required
+
+### Trust and Integrity Model
+
+Separate from the access-control model above, the proxy's **data integrity model** describes what it verifies about cached bytes, what it trusts upstream components to guarantee, and what's explicitly out of scope.
+
+**What the proxy trusts**:
+- **S3 validates bytes on ingress.** Every PUT and UploadPart is forwarded unmodified to S3. If S3 returns 200, its stored bytes match what the client sent (plus S3's own checksum of record — default CRC64NVME since December 2024).
+- **LZ4 frame content checksums catch disk corruption.** All cached bytes — compressed or uncompressed-frame-wrapped — carry an xxhash32 frame checksum (see [COMPRESSION.md](COMPRESSION.md#integrity-lz4-frame-content-checksums)). Bit-flips surface as decode errors and are handled as cache misses.
+- **The storage layer catches lower-level corruption.** Filesystem and block-device integrity (EFS, ext4, XFS) cover everything below the frame checksum.
+
+**What the proxy verifies**:
+- **ETag equality for read invalidation.** On conditional revalidation and range reads, mismatched ETags invalidate cached entries (see `invalidate_stale_ranges`).
+- **ETag equality at multipart finalization.** `CompleteMultipartUpload` request body ETags per part are compared against the proxy's recorded per-part ETags. On any mismatch the cache finalization is skipped and the `mpus_in_progress/{uploadId}/` directory is cleaned up — the client still gets S3's success response, the cache just doesn't retain the object. Covered in [MULTIPART_UPLOAD.md](MULTIPART_UPLOAD.md).
+- **aws-chunked decoded length.** When the `x-amz-decoded-content-length` header is present, the decoder verifies the decoded body length matches and skips caching on mismatch (see `aws_chunked_decoder`).
+- **Cache metadata structural consistency.** The `cache_validator` module checks metadata JSON parses, ranges don't overlap, range sizes match their offsets, and referenced range files exist.
+
+**Cache staleness is not a security boundary.** Any client with valid S3 credentials can write directly to a bucket, bypassing the proxy entirely. When that happens, cached entries for affected objects become stale until the next read triggers ETag-based revalidation. This is normal cache behaviour, not an attack scenario — the mitigations are the same as any read-through cache: tune TTLs, use TTL=0 for per-request authorization, or configure clients to always go through the proxy.
+
+**Residual integrity gap**:
+For a motivated attacker who can both (a) intercept a client's multipart upload in flight and substitute one part via a direct-to-S3 UploadPart call, and (b) produce an MD5 collision for that part, the cache could retain bytes that no longer match what S3 stored. This gap exists because per-part ETags on SSE-S3 single-part data are MD5 of the content, and MD5 is not collision-resistant. The same attacker could confuse any client or tool relying on ETag matching for integrity — this is not a proxy-specific weakness.
+
+Mitigations at the bucket/client layer (not the proxy):
+- **Specify a stronger checksum algorithm at `CreateMultipartUpload`** (e.g., `--checksum-algorithm SHA256`). Per-part checksums then land in the `CompleteMultipartUpload` request body and S3 verifies them end-to-end.
+- **Use SSE-KMS** so ETags become opaque, non-content-derived strings that an attacker cannot forge via content manipulation.
 
 ### Deployment Guidelines
 

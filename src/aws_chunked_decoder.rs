@@ -1,13 +1,32 @@
 //! AWS Chunked Encoding Decoder
 //!
-//! Decodes aws-chunked encoded bodies used by AWS CLI for SigV4 streaming uploads.
-//! The format is: `chunk-size;chunk-signature=sig\r\n data\r\n ... 0;chunk-signature=sig\r\n\r\n`
+//! Decodes aws-chunked encoded bodies used by AWS CLI and SDKs for SigV4 streaming
+//! uploads. The format is:
+//! `chunk-size;chunk-signature=sig\r\n data\r\n ... 0;chunk-signature=sig\r\n\r\n`
 //!
-//! This module provides functions to:
-//! - Detect aws-chunked encoding from request headers
-//! - Extract the decoded content length from headers
-//! - Decode aws-chunked bodies to extract actual data
-//! - Encode data as aws-chunked format (for testing round-trips)
+//! This module provides:
+//! - [`is_aws_chunked`] — detect aws-chunked encoding from request headers
+//!   (`content-encoding: aws-chunked` or `x-amz-content-sha256: STREAMING-…`).
+//!   Does NOT byte-sniff the body — header-based detection only.
+//! - [`get_decoded_content_length`] — read `x-amz-decoded-content-length` if
+//!   present. Always validate the decoder's output length against this value
+//!   when it is present and skip caching on mismatch.
+//! - [`decode_aws_chunked`] — decode a complete chunked body to plain bytes.
+//! - [`encode_aws_chunked`] — encode plain bytes as chunked (for tests only).
+//!
+//! # When to use this module
+//!
+//! Any PUT/UploadPart code path that needs to cache the *decoded* body while
+//! forwarding the *original* (chunked, still-signature-valid) body to S3. Both
+//! the non-multipart PUT path (`handle_with_caching`) and the multipart
+//! UploadPart path (`handle_upload_part`) use this module for that exact split.
+//!
+//! # Do not reinvent chunk parsing
+//!
+//! Earlier versions of the multipart path had their own byte-sniffing stripper
+//! that looked at the first hex-digit byte and counted CRLFs. It was replaced
+//! with this module because byte-sniffing can misidentify non-chunked bodies
+//! that happen to start with a hex digit. Use the header-based detection here.
 
 use std::collections::HashMap;
 use std::fmt;

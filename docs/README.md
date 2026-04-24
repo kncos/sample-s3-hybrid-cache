@@ -16,6 +16,7 @@ Welcome to the S3 Proxy documentation. This guide provides comprehensive informa
 
 ### Advanced Features
 - [Write-Through Caching](CACHING.md#write-cache-configuration) - PUT operation caching
+- [Multipart Upload Caching](MULTIPART_UPLOAD.md) - Multipart upload cache internals and correctness model
 - [Range Request Optimization](CACHING.md#range-request-optimization) - Intelligent range handling
 - [Compression Optimization](COMPRESSION.md#ram-cache-compression-optimization) - Efficient memory usage
 - [Dashboard](DASHBOARD.md) - Web-based monitoring interface

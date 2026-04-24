@@ -5,6 +5,15 @@ All notable changes to S3 Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-04-24
+
+### Fixed
+- **Multipart write-through cache: concurrent same-part-number race**: When two `UploadPart` requests for the same `uploadId` and same part number arrived concurrently on a shared cache volume — possible with a buggy client issuing parallel retries, a custom non-SDK client that explicitly parallelizes same-part writes, or duplicate requests produced upstream of the proxy — the part file rename and the tracker update in `cache_upload_part` ran outside the same critical section. Interleaved ordering could leave the on-disk bytes from upload A paired with upload B's ETag in the tracker, producing a cache entry that passed the finalize-time ETag check but served the wrong bytes on subsequent reads. The part file write and tracker update now run together inside the existing `upload.lock` critical section, so the bytes-on-disk and the tracker ETag are updated atomically. Added `test_cache_upload_part_concurrent_same_part_keeps_file_and_tracker_consistent` which uses two handler instances on a shared cache dir to drive the race and verifies on-disk content always matches the tracker's recorded ETag.
+- **Multipart UploadPart: bodies starting with a hex digit could be mis-stripped**: The previous `handle_upload_part` used a byte-sniffer that looked for a hex digit followed by `\r\n` at the start of the body and, if found, stripped the leading chunk-size framing before caching. For genuinely aws-chunked bodies this was correct; for any non-chunked body that happened to start with those bytes (small probability but nonzero for binary content), the first few bytes would be removed from the cached copy while S3 received the unmodified body — leading to a cached entry silently diverging from S3. Replaced the sniffer with the `aws_chunked_decoder` module the non-multipart PUT path already uses: detection is header-based (`content-encoding` / `x-amz-content-sha256`), the decoded length is validated against `x-amz-decoded-content-length` when present, and failures record `record_cache_bypass("aws_chunked_decode_error")` and skip caching that part rather than cache potentially-corrupt bytes. S3 receives the unmodified original body in all cases.
+
+### Tests
+- **`test_load_range_data_large_range`: removed wall-clock timing assertion**: The test asserted a 10MB range load completes in under 100ms, which reliably passed in isolation but failed under parallel test execution due to disk/CPU contention. The hard-coded threshold cited no product requirement and conflated correctness with performance. Removed the timing check; correctness assertions (data round-trips intact) are retained. Performance regression detection belongs in a benchmark, not a unit test.
+
 ## [1.10.1] - 2026-04-15
 
 ### Added

@@ -1,8 +1,35 @@
-//! Signed PUT Handler Module
+//! Signed PUT and Multipart Upload Handler
 //!
-//! Orchestrates the caching of AWS SigV4 signed PUT requests by streaming
-//! the request body simultaneously to both S3 and the local cache.
-//! This preserves signature integrity while enabling efficient caching.
+//! Handles AWS SigV4 signed write requests: single-part PUT plus the four
+//! multipart upload operations. Every request is forwarded to S3 unmodified
+//! (the proxy holds no credentials and cannot re-sign) and cached in parallel.
+//!
+//! Handler routing (from `handle_signed_put`):
+//!
+//! | Request                                   | Handler                               |
+//! | ----------------------------------------- | ------------------------------------- |
+//! | `PUT /key` (non-multipart)                | [`SignedPutHandler::handle_with_caching`] |
+//! | `POST /key?uploads`                       | [`SignedPutHandler::handle_create_multipart_upload`] |
+//! | `PUT  /key?uploadId=X&partNumber=N`       | [`SignedPutHandler::handle_upload_part`] |
+//! | `POST /key?uploadId=X` (no partNumber)    | [`SignedPutHandler::handle_complete_multipart_upload`] |
+//! | `DELETE /key?uploadId=X`                  | [`SignedPutHandler::handle_abort_multipart_upload`] |
+//!
+//! # Multipart upload invariants
+//!
+//! For the multipart code paths in particular, see
+//! [`docs/MULTIPART_UPLOAD.md`](../../../docs/MULTIPART_UPLOAD.md) for the
+//! state machine, correctness gates, concurrency semantics, and threat model.
+//! Short version:
+//!
+//! - In-flight state lives under `{cache_dir}/mpus_in_progress/{uploadId}/`.
+//! - `cache_upload_part` must hold `upload.lock` across both the part-file
+//!   rename and the tracker update — same-part-number concurrent writes rely
+//!   on this.
+//! - `finalize_multipart_upload` only retains the cache if S3 succeeded, the
+//!   request body parses, every requested part is cached locally, and every
+//!   requested ETag matches the tracker. Any miss → cleanup, no cache entry.
+//! - `aws_chunked_decoder` is the one true chunk parser for both this handler
+//!   and the non-multipart PUT path.
 
 use crate::aws_chunked_decoder;
 use crate::capacity_manager::{check_cache_capacity, log_bypass_decision, CacheDecision};
@@ -1570,60 +1597,87 @@ impl SignedPutHandler {
                 );
 
                 // Check if body starts with chunked encoding (AWS CLI sends chunked data)
-                // We'll strip it ONLY for caching, but send the original to S3
-                // Format: "<hex-size>\r\n<data>\r\n"
-                let cache_body_bytes = if original_body_bytes.len() > 10
-                    && original_body_bytes[0].is_ascii_hexdigit()
-                {
-                    // Try to parse chunk size
-                    if let Some(first_crlf) =
-                        original_body_bytes.windows(2).position(|w| w == b"\r\n")
-                    {
-                        if let Ok(chunk_size_str) =
-                            std::str::from_utf8(&original_body_bytes[..first_crlf])
-                        {
-                            if let Ok(chunk_size) = usize::from_str_radix(chunk_size_str, 16) {
-                                let chunk_start = first_crlf + 2; // Skip "\r\n"
-                                let chunk_end = chunk_start + chunk_size;
+                // We'll strip it ONLY for caching, but send the original to S3.
+                // Uses the same aws_chunked_decoder module as the non-multipart PUT path
+                // (handle_with_caching), which validates chunk framing and, when the
+                // x-amz-decoded-content-length header is present, verifies the decoded
+                // length matches. On any failure we skip caching this part (bypass
+                // metric recorded) rather than cache potentially-corrupt bytes.
+                //
+                // None = skip caching this part. Some(bytes) = cache these bytes.
+                let cache_body_bytes: Option<Bytes> = if aws_chunked_decoder::is_aws_chunked(&request_headers) {
+                    match aws_chunked_decoder::decode_aws_chunked(&original_body_bytes) {
+                        Ok(decoded) => {
+                            let decoded_len = decoded.len() as u64;
 
-                                // Verify the chunk ends with "\r\n"
-                                if chunk_end + 2 <= original_body_bytes.len()
-                                    && &original_body_bytes[chunk_end..chunk_end + 2] == b"\r\n"
-                                {
-                                    debug!(
-                                        "Detected chunked encoding: chunk_size={}, will strip {} header bytes and {} trailer bytes for caching only",
-                                        chunk_size, chunk_start, original_body_bytes.len() - chunk_end
+                            // If the header is present, validate the decoded length.
+                            // A mismatch means the framing parsed but produced wrong
+                            // bytes, which would silently cache corrupt content — so
+                            // we skip caching instead and record a bypass metric.
+                            if let Some(expected) =
+                                aws_chunked_decoder::get_decoded_content_length(&request_headers)
+                            {
+                                if decoded_len != expected {
+                                    warn!(
+                                        "aws-chunked decode length mismatch: cache_key={}, upload_id={}, part_number={}, expected={}, actual={} - skipping cache",
+                                        cache_key, upload_id, part_number, expected, decoded_len
                                     );
-
-                                    // Extract just the chunk data for caching
-                                    let stripped =
-                                        original_body_bytes.slice(chunk_start..chunk_end);
-
-                                    // Log chunked decoding with sampling
+                                    if let Some(metrics) = &self.metrics_manager {
+                                        let metrics_clone = metrics.clone();
+                                        tokio::spawn(async move {
+                                            metrics_clone
+                                                .read()
+                                                .await
+                                                .record_cache_bypass("aws_chunked_decode_error")
+                                                .await;
+                                        });
+                                    }
+                                    None
+                                } else {
                                     if self.log_sampler.should_log("chunked_decode") {
                                         debug!(
                                             part_number = part_number,
                                             original_bytes = original_body_bytes.len(),
-                                            stripped_bytes = stripped.len(),
-                                            "Chunked encoding stripped for caching"
+                                            decoded_bytes = decoded_len,
+                                            "aws-chunked decoded for caching"
                                         );
                                     }
-
-                                    stripped
-                                } else {
-                                    original_body_bytes.clone()
+                                    Some(Bytes::from(decoded))
                                 }
                             } else {
-                                original_body_bytes.clone()
+                                // No length header to validate against; trust the decoder.
+                                if self.log_sampler.should_log("chunked_decode") {
+                                    debug!(
+                                        part_number = part_number,
+                                        original_bytes = original_body_bytes.len(),
+                                        decoded_bytes = decoded_len,
+                                        "aws-chunked decoded for caching (no length header)"
+                                    );
+                                }
+                                Some(Bytes::from(decoded))
                             }
-                        } else {
-                            original_body_bytes.clone()
                         }
-                    } else {
-                        original_body_bytes.clone()
+                        Err(e) => {
+                            warn!(
+                                "aws-chunked decode failed: cache_key={}, upload_id={}, part_number={}, error={} - skipping cache for this part",
+                                cache_key, upload_id, part_number, e
+                            );
+                            if let Some(metrics) = &self.metrics_manager {
+                                let metrics_clone = metrics.clone();
+                                tokio::spawn(async move {
+                                    metrics_clone
+                                        .read()
+                                        .await
+                                        .record_cache_bypass("aws_chunked_decode_error")
+                                        .await;
+                                });
+                            }
+                            None
+                        }
                     }
                 } else {
-                    original_body_bytes.clone()
+                    // Not aws-chunked; cache the body verbatim.
+                    Some(original_body_bytes.clone())
                 };
 
                 // Forward ORIGINAL body to S3 (with chunked encoding intact)
@@ -1676,32 +1730,37 @@ impl SignedPutHandler {
                         .cloned()
                         .unwrap_or_default();
 
-                    // Cache the part as a range file (Requirement 5.1, 8.1, 9.3)
-                    // Use the stripped body (without chunked encoding) for caching
-                    if let Err(e) = self
-                        .cache_upload_part(
-                            &cache_key,
-                            &upload_id,
-                            part_number,
-                            &cache_body_bytes,
-                            &etag,
-                        )
-                        .await
-                    {
-                        error!(
-                            "Failed to cache UploadPart: cache_key={}, upload_id={}, part_number={}, size={}, error_type={}, error={}",
-                            cache_key, upload_id, part_number, cache_body_bytes.len(), Self::classify_error(&e), e
-                        );
-                    } else {
-                        // Log successful UploadPart with concise format
-                        let (bucket, key) = parse_cache_key(&cache_key);
-                        info!(
-                            "UploadPart: bucket={}, key={}, part={}, size={}",
-                            bucket,
-                            key,
-                            part_number,
-                            format_size(cache_body_bytes.len() as u64)
-                        );
+                    // Cache the part as a range file (Requirement 5.1, 8.1, 9.3).
+                    // When aws-chunked decoding failed above, cache_body_bytes is None
+                    // and we skip caching this part; the bypass metric was already
+                    // recorded. S3 has the correct bytes either way since we always
+                    // forward the unmodified body.
+                    if let Some(ref cache_bytes) = cache_body_bytes {
+                        if let Err(e) = self
+                            .cache_upload_part(
+                                &cache_key,
+                                &upload_id,
+                                part_number,
+                                cache_bytes,
+                                &etag,
+                            )
+                            .await
+                        {
+                            error!(
+                                "Failed to cache UploadPart: cache_key={}, upload_id={}, part_number={}, size={}, error_type={}, error={}",
+                                cache_key, upload_id, part_number, cache_bytes.len(), Self::classify_error(&e), e
+                            );
+                        } else {
+                            // Log successful UploadPart with concise format
+                            let (bucket, key) = parse_cache_key(&cache_key);
+                            info!(
+                                "UploadPart: bucket={}, key={}, part={}, size={}",
+                                bucket,
+                                key,
+                                part_number,
+                                format_size(cache_bytes.len() as u64)
+                            );
+                        }
                     }
                 } else {
                     // S3 returned error (Requirement 8.2, 9.3)
@@ -1774,12 +1833,37 @@ impl SignedPutHandler {
         // Store part data in the upload-specific directory (isolated per upload_id)
         let part_file_path = multipart_dir.join(format!("part{}.bin", part_number));
 
-        // Compress the part data
+        // Compress the part data (no shared state touched, safe outside the lock)
         let compression_result = self
             .compression_handler
             .compress_content_aware_with_metadata(data, cache_key);
 
-        // Write part file atomically using temp file + rename
+        // Acquire lock BEFORE writing part file and updating tracker.
+        //
+        // Holding the upload.lock across both the part-file write AND the tracker
+        // update ensures that a misbehaving or racing client which issues concurrent
+        // UploadPart requests for the same part number on the same upload_id cannot
+        // leave the on-disk bytes and the tracker's ETag out of sync. Without this,
+        // interleaved file renames and tracker updates could cause the tracker to
+        // record ETag_A while the bytes on disk are from upload B (or vice versa),
+        // producing a cache entry that deserializes fine but serves incorrect data.
+        let upload_meta_file = multipart_dir.join("upload.meta");
+        let lock_file_path = multipart_dir.join("upload.lock");
+
+        // Create lock file if it doesn't exist
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_file_path)
+            .map_err(|e| ProxyError::CacheError(format!("Failed to open lock file: {}", e)))?;
+
+        // Acquire exclusive lock for the full file-write + tracker-update critical section
+        lock_file.lock_exclusive().map_err(|e| {
+            ProxyError::CacheError(format!("Failed to acquire lock for upload.meta: {}", e))
+        })?;
+
+        // Write part file atomically using temp file + rename (inside the lock)
         let temp_part_file_path = part_file_path.with_extension("tmp");
         tokio::fs::write(&temp_part_file_path, &compression_result.data)
             .await
@@ -1807,23 +1891,6 @@ impl SignedPutHandler {
             etag.to_string(),
             compression_result.algorithm.clone(),
         );
-
-        // Acquire lock and update upload.meta with part info
-        let upload_meta_file = multipart_dir.join("upload.meta");
-        let lock_file_path = multipart_dir.join("upload.lock");
-
-        // Create lock file if it doesn't exist
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_file_path)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to open lock file: {}", e)))?;
-
-        // Acquire exclusive lock
-        lock_file.lock_exclusive().map_err(|e| {
-            ProxyError::CacheError(format!("Failed to acquire lock for upload.meta: {}", e))
-        })?;
 
         // Read existing tracker or create new one
         let mut tracker = if upload_meta_file.exists() {
@@ -3377,6 +3444,148 @@ mod tests {
         assert_eq!(tracker.parts[0].size, data.len() as u64);
         assert_eq!(tracker.parts[0].etag, etag);
         assert_eq!(tracker.total_size, data.len() as u64);
+    }
+
+    /// Test that concurrent UploadPart calls for the *same* part number on the
+    /// *same* upload_id cannot leave the on-disk bytes out of sync with the
+    /// tracker's ETag.
+    ///
+    /// This reproduces the pattern a misbehaving or racing client could produce:
+    /// two UploadPart requests for part N overlap in time on a shared cache
+    /// volume. Without the lock covering both the file write and the tracker
+    /// update, interleaved renames and tracker writes can result in a tracker
+    /// that references ETag_A while the on-disk bytes are from upload B.
+    ///
+    /// Uses two separate SignedPutHandler instances pointing at the same cache
+    /// dir — the same shape as two proxy instances sharing an EFS volume, which
+    /// is where this race would realistically surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cache_upload_part_concurrent_same_part_keeps_file_and_tracker_consistent() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let cache_key = "test-bucket/concurrent-part-object";
+        let upload_id = "test-upload-concurrent";
+        let part_number = 1u32;
+
+        // Two distinct payloads with distinct ETags — the pairing must hold.
+        // Using sizes above the compression threshold (1024) so both paths
+        // exercise the same compression code.
+        let data_a = vec![b'A'; 4096];
+        let etag_a = "\"etag-a-1111111111111111111111\"";
+        let data_b = vec![b'B'; 4096];
+        let etag_b = "\"etag-b-2222222222222222222222\"";
+
+        // Drive many interleavings. Each iteration creates two fresh handlers
+        // on the same cache dir and races them via tokio::join!.
+        for iteration in 0..16 {
+            // Fresh upload_id each iteration so prior iterations can't affect
+            // the outcome via stale state.
+            let iter_upload_id = format!("{}-iter-{}", upload_id, iteration);
+
+            let temp_path = temp_dir.path().to_path_buf();
+            let key = cache_key.to_string();
+            let upload = iter_upload_id.clone();
+            let data_a_clone = data_a.clone();
+            let etag_a_s = etag_a.to_string();
+            let data_b_clone = data_b.clone();
+            let etag_b_s = etag_b.to_string();
+
+            let handle_a = tokio::spawn(async move {
+                let compression_handler = CompressionHandler::new(1024, true);
+                let mut handler = SignedPutHandler::new(
+                    temp_path,
+                    compression_handler,
+                    0,
+                    10 * 1024 * 1024,
+                    None,
+                );
+                handler
+                    .cache_upload_part(&key, &upload, part_number, &data_a_clone, &etag_a_s)
+                    .await
+            });
+
+            let temp_path_b = temp_dir.path().to_path_buf();
+            let key_b = cache_key.to_string();
+            let upload_b = iter_upload_id.clone();
+            let handle_b = tokio::spawn(async move {
+                let compression_handler = CompressionHandler::new(1024, true);
+                let mut handler = SignedPutHandler::new(
+                    temp_path_b,
+                    compression_handler,
+                    0,
+                    10 * 1024 * 1024,
+                    None,
+                );
+                handler
+                    .cache_upload_part(&key_b, &upload_b, part_number, &data_b_clone, &etag_b_s)
+                    .await
+            });
+
+            let (res_a, res_b) = tokio::join!(handle_a, handle_b);
+            res_a.expect("task A panicked").expect("upload A failed");
+            res_b.expect("task B panicked").expect("upload B failed");
+
+            // Read the final tracker state.
+            let multipart_dir = temp_dir
+                .path()
+                .join("mpus_in_progress")
+                .join(&iter_upload_id);
+            let upload_meta_file = multipart_dir.join("upload.meta");
+            let meta_content = std::fs::read_to_string(&upload_meta_file)
+                .expect("upload.meta should exist after both writes");
+            let tracker: crate::cache_types::MultipartUploadTracker =
+                serde_json::from_str(&meta_content).expect("upload.meta parses");
+
+            assert_eq!(
+                tracker.parts.len(),
+                1,
+                "iteration {}: tracker should have exactly one entry for the part number",
+                iteration
+            );
+            let tracked_part = &tracker.parts[0];
+            assert_eq!(tracked_part.part_number, part_number);
+
+            // Read the on-disk part file. It was LZ4-frame-compressed by the
+            // winner's call; decompress and compare to the expected raw bytes
+            // that correspond to the tracked ETag. This is the core invariant:
+            // whatever ETag the tracker recorded, the on-disk bytes MUST be the
+            // bytes that that ETag describes.
+            let part_file = multipart_dir.join(format!("part{}.bin", part_number));
+            let compressed_bytes =
+                std::fs::read(&part_file).expect("part file exists after writes");
+            let compression_handler = CompressionHandler::new(1024, true);
+            let decompressed = compression_handler
+                .decompress_data(&compressed_bytes)
+                .expect("part file decompresses (frame checksum verifies)");
+
+            let expected_bytes = if tracked_part.etag == etag_a {
+                &data_a
+            } else if tracked_part.etag == etag_b {
+                &data_b
+            } else {
+                panic!(
+                    "iteration {}: tracker has unexpected etag {:?}",
+                    iteration, tracked_part.etag
+                );
+            };
+
+            assert_eq!(
+                decompressed.len(),
+                expected_bytes.len(),
+                "iteration {}: on-disk decompressed size must match the ETag recorded in the tracker",
+                iteration
+            );
+            assert_eq!(
+                &decompressed, expected_bytes,
+                "iteration {}: on-disk bytes must match the payload for the tracker's ETag",
+                iteration
+            );
+            assert_eq!(
+                tracked_part.size, expected_bytes.len() as u64,
+                "iteration {}: tracker-recorded size must match payload size",
+                iteration
+            );
+        }
     }
 
     #[tokio::test]

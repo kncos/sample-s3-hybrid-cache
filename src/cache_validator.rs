@@ -1,7 +1,29 @@
 //! Cache Validator Module
 //!
-//! Provides shared validation utilities for cache subsystems to eliminate duplicate logic
-//! and ensure consistent validation behavior across WriteCacheManager and CacheSizeTracker.
+//! Shared validation utilities for cache subsystems. Covers structural integrity of
+//! the on-disk cache metadata: JSON parses cleanly, ranges don't overlap, sizes
+//! in metadata are arithmetically consistent (`end - start + 1`), referenced
+//! range files exist, and so on.
+//!
+//! This is structural validation only. Byte-level content integrity is provided
+//! separately by the LZ4 frame content checksum (xxhash32) which the compressor
+//! attaches to every cached range file and which the decompressor verifies on
+//! every read. See `crate::compression` and `docs/COMPRESSION.md`.
+//!
+//! # When to use this module
+//!
+//! - Periodic cache-consistency sweeps.
+//! - Diagnostic tooling (dashboard, ops scripts) that needs to enumerate and
+//!   characterize cache contents.
+//! - Any code path that needs to decide whether a metadata file is safe to
+//!   trust before reading its referenced ranges.
+//!
+//! # When NOT to roll your own
+//!
+//! If you find yourself writing ad-hoc checks for "does this metadata file
+//! parse", "do its range offsets add up", or "are its range files present",
+//! use [`CacheValidator`] instead. It has been tuned for parallel scan
+//! performance and has established error types.
 //!
 //! # Requirements
 //! - Requirement 5.1: Shared metadata validation logic

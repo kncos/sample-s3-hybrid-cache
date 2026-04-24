@@ -2,6 +2,14 @@
 
 The S3 proxy includes intelligent compression with per-entry algorithm metadata that automatically determines which files should be compressed based on their file extensions. The system is optimized to eliminate unnecessary compression cycles between cache tiers.
 
+## Integrity: LZ4 Frame Content Checksums
+
+Every cached entry — whether compressed or stored as an uncompressed LZ4-framed wrapper — carries an **xxhash32 content checksum** in its LZ4 frame header (`FrameInfo::content_checksum = true`). This is why the proxy wraps incompressible data in an uncompressed LZ4 frame rather than writing raw bytes: the wrapper provides the integrity check for free.
+
+On every read, the LZ4 frame decoder verifies the checksum as it decodes. Any disk bit-flip, truncation, or silent corruption of a range file surfaces as a decode error, which callers treat as a cache miss and refetch from S3. No separate hash-at-rest or read-time re-hashing is required.
+
+Both compressed and uncompressed-wrapped writes go through `CompressionHandler::wrap_in_frame` / `compress_data`; both set the same frame flag. Tests `test_corrupted_frame_data_returns_error` and `test_corrupt_cache_entry_decompression_error` cover the corruption path.
+
 ## Files That Are Compressed (LZ4)
 
 - **Text files**: `.txt`, `.json`, `.xml`, `.html`, `.css`, `.js`, `.csv`, `.log`, `.md`
