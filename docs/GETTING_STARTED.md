@@ -498,14 +498,15 @@ The CLI resolves the alias to `mfzwi23gnjvgw.accesspoint.s3-global.amazonaws.com
 
 #### Access Point Endpoint Summary
 
-| Access Pattern | Endpoint URL | Works? | Notes |
+| Access Pattern | Endpoint URL | Cached? | Notes |
 |---|---|---|---|
-| AP alias | `http://s3.{region}.amazonaws.com` | Yes | Recommended for caching |
-| AP ARN | `http://s3-accesspoint.{region}.amazonaws.com` | Yes | CLI builds correct Host from ARN |
-| AP alias | `http://s3-accesspoint.{region}.amazonaws.com` | No | Base domain doesn't resolve via public DNS |
-| MRAP alias | `http://accesspoint.s3-global.amazonaws.com` | Yes | CLI builds correct Host from alias |
-| MRAP ARN | `http://accesspoint.s3-global.amazonaws.com` | Yes | CLI builds correct Host from ARN |
-| Any AP/MRAP | (no endpoint, default HTTPS) | Bypasses cache | HTTPS uses TCP passthrough |
+| AP alias | `http://s3.{region}.amazonaws.com` | ✅ Yes | Alias resolves under `*.s3.{region}` wildcard. Proxy can resolve this upstream. |
+| AP ARN | `http://s3.{region}.amazonaws.com` | ✅ Yes | CLI builds Host from ARN. Either endpoint works for ARN-based requests. |
+| AP ARN | `http://s3-accesspoint.{region}.amazonaws.com` | ✅ Yes | CLI builds Host from ARN. Either endpoint works for ARN-based requests. |
+| AP alias | `http://s3-accesspoint.{region}.amazonaws.com` | ❌ No | Bare `s3-accesspoint` domain doesn't resolve via public DNS; proxy can't connect upstream. |
+| MRAP alias | `http://accesspoint.s3-global.amazonaws.com` | ✅ Yes | CLI builds correct Host from alias. |
+| MRAP ARN | `http://accesspoint.s3-global.amazonaws.com` | ✅ Yes | CLI builds correct Host from ARN. |
+| Any AP/MRAP | *(none — default HTTPS)* | ❌ No | HTTPS uses TCP passthrough, bypassing cache. |
 
 ## Basic Usage
 
