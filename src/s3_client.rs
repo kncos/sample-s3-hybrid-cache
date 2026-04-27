@@ -970,9 +970,13 @@ pub fn build_s3_request_context(
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or(uri.path());
-        format!("https://{}{}", host, path_and_query)
-            .parse()
-            .unwrap_or(uri) // Fallback to original URI if parsing fails
+        format!(
+            "https://{}{}",
+            format_authority_host(&host, None),
+            path_and_query
+        )
+        .parse()
+        .unwrap_or(uri) // Fallback to original URI if parsing fails
     } else {
         // URI is already absolute
         uri
@@ -1010,9 +1014,13 @@ pub fn build_s3_request_context_with_operation(
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or(uri.path());
-        format!("https://{}{}", host, path_and_query)
-            .parse()
-            .unwrap_or(uri) // Fallback to original URI if parsing fails
+        format!(
+            "https://{}{}",
+            format_authority_host(&host, None),
+            path_and_query
+        )
+        .parse()
+        .unwrap_or(uri) // Fallback to original URI if parsing fails
     } else {
         // URI is already absolute
         uri
@@ -1053,6 +1061,19 @@ fn rewrite_uri_authority(original: &Uri, ip: &IpAddr) -> std::result::Result<Uri
     new_uri_str
         .parse::<Uri>()
         .map_err(|e| format!("Failed to parse rewritten URI '{}': {}", new_uri_str, e))
+}
+
+/// Format a hostname for use in a URI authority, bracketing IPv6 literals.
+fn format_authority_host(host: &str, port: Option<u16>) -> String {
+    let bracketed = if host.contains(':') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    };
+    match port {
+        Some(p) => format!("{}:{}", bracketed, p),
+        None => bracketed,
+    }
 }
 
 #[cfg(test)]
@@ -1463,5 +1484,24 @@ mod tests {
         assert_eq!(result.path(), "/");
     }
 
+    #[test]
+    fn test_format_authority_host_brackets_ipv6() {
+        // Validates: Requirements 6.1, 6.2
+        assert_eq!(format_authority_host("::1", Some(443)), "[::1]:443");
+    }
 
+    #[test]
+    fn test_format_authority_host_plain_hostname() {
+        // Validates: Requirements 6.2
+        assert_eq!(
+            format_authority_host("example.com", Some(443)),
+            "example.com:443"
+        );
+    }
+
+    #[test]
+    fn test_format_authority_host_no_port() {
+        // Validates: Requirements 6.1
+        assert_eq!(format_authority_host("::1", None), "[::1]");
+    }
 }

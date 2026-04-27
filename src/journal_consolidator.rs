@@ -2594,7 +2594,16 @@ impl JournalConsolidator {
 
         for entry in entries {
             // Check if the range file exists
-            let range_file_path = self.get_range_file_path(&entry.cache_key, &entry.range_spec);
+            let range_file_path = match self.get_range_file_path(&entry.cache_key, &entry.range_spec) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Skipping journal entry with malformed cache key in validate_journal_entries: cache_key={}, error={}",
+                        entry.cache_key, e
+                    );
+                    continue;
+                }
+            };
 
             if range_file_path.exists() {
                 valid_entries.push(entry.clone());
@@ -2721,7 +2730,16 @@ impl JournalConsolidator {
             }
 
             // Check if the range file exists
-            let range_file_path = self.get_range_file_path(&entry.cache_key, &entry.range_spec);
+            let range_file_path = match self.get_range_file_path(&entry.cache_key, &entry.range_spec) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Skipping journal entry with malformed cache key in validate_journal_entries_with_staleness: cache_key={}, error={}",
+                        entry.cache_key, e
+                    );
+                    continue;
+                }
+            };
 
             if range_file_path.exists() {
                 // Range file exists - entry is valid
@@ -3005,7 +3023,7 @@ impl JournalConsolidator {
         cache_key: &str,
         journal_entries: &[JournalEntry],
     ) -> Result<NewCacheMetadata> {
-        let metadata_path = self.get_metadata_file_path(cache_key);
+        let metadata_path = self.get_metadata_file_path(cache_key)?;
 
         if metadata_path.exists() {
             // Load existing metadata
@@ -3076,7 +3094,7 @@ impl JournalConsolidator {
         metadata: &NewCacheMetadata,
         _lock: &crate::metadata_lock_manager::MetadataLock,
     ) -> Result<()> {
-        let metadata_path = self.get_metadata_file_path(&metadata.cache_key);
+        let metadata_path = self.get_metadata_file_path(&metadata.cache_key)?;
 
         // Ensure parent directory exists
         if let Some(parent) = metadata_path.parent() {
@@ -3579,42 +3597,28 @@ impl JournalConsolidator {
         }
     }
 
-    /// Get metadata file path for a cache key
+    /// Get metadata file path for a cache key.
     ///
-    /// # Panics
-    /// Panics if cache_key is malformed (missing bucket/object separator).
-    fn get_metadata_file_path(&self, cache_key: &str) -> PathBuf {
+    /// # Errors
+    /// Returns `ProxyError::CacheError` if `cache_key` is malformed (missing
+    /// `bucket/object` separator or containing a rejected bucket segment).
+    fn get_metadata_file_path(&self, cache_key: &str) -> Result<PathBuf> {
         let base_dir = self.cache_dir.join("metadata");
 
         // Use the same sharding logic as DiskCacheManager for consistency
-        match crate::disk_cache::get_sharded_path(&base_dir, cache_key, ".meta") {
-            Ok(path) => path,
-            Err(e) => {
-                panic!(
-                    "Malformed cache key '{}': {}. Cache keys must be in 'bucket/object' format.",
-                    cache_key, e
-                );
-            }
-        }
+        crate::disk_cache::get_sharded_path(&base_dir, cache_key, ".meta")
     }
 
-    /// Get range file path for a cache key and range spec
+    /// Get range file path for a cache key and range spec.
     ///
-    /// # Panics
-    /// Panics if cache_key is malformed (missing bucket/object separator).
-    fn get_range_file_path(&self, cache_key: &str, range_spec: &RangeSpec) -> PathBuf {
+    /// # Errors
+    /// Returns `ProxyError::CacheError` if `cache_key` is malformed (missing
+    /// `bucket/object` separator or containing a rejected bucket segment).
+    fn get_range_file_path(&self, cache_key: &str, range_spec: &RangeSpec) -> Result<PathBuf> {
         let base_dir = self.cache_dir.join("ranges");
         let suffix = format!("_{}-{}.bin", range_spec.start, range_spec.end);
 
-        match crate::disk_cache::get_sharded_path(&base_dir, cache_key, &suffix) {
-            Ok(path) => path,
-            Err(e) => {
-                panic!(
-                    "Malformed cache key '{}': {}. Cache keys must be in 'bucket/object' format.",
-                    cache_key, e
-                );
-            }
-        }
+        crate::disk_cache::get_sharded_path(&base_dir, cache_key, &suffix)
     }
     /// Graceful shutdown of the journal consolidator
     ///
@@ -3830,7 +3834,7 @@ mod tests {
         assert_eq!(valid_entries.len(), 0);
 
         // Create the range file
-        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec);
+        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec).unwrap();
         if let Some(parent) = range_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
@@ -4631,7 +4635,7 @@ mod tests {
         };
 
         // Create the range file so validation passes
-        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec);
+        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec).unwrap();
         if let Some(parent) = range_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
@@ -4727,7 +4731,7 @@ mod tests {
         };
 
         // Create the range file
-        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec);
+        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec).unwrap();
         if let Some(parent) = range_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
@@ -4877,7 +4881,7 @@ mod tests {
         };
 
         // Create the range file
-        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec);
+        let range_file_path = consolidator.get_range_file_path(cache_key, &range_spec).unwrap();
         if let Some(parent) = range_file_path.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
@@ -5992,6 +5996,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_get_metadata_file_path_rejects_malformed() {
+        // Validates: Requirements 3.1, 5.6
+        let temp_dir = TempDir::new().unwrap();
+        let journal_manager = Arc::new(JournalManager::new(
+            temp_dir.path().to_path_buf(),
+            "test-instance".to_string(),
+        ));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            temp_dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            3,
+        ));
+        let consolidator = JournalConsolidator::new(
+            temp_dir.path().to_path_buf(),
+            journal_manager,
+            lock_manager,
+            ConsolidationConfig::default(),
+        );
 
+        let result = consolidator.get_metadata_file_path("noslash");
+        assert!(result.is_err(), "Malformed cache key must return Err, got Ok");
+    }
 
+    #[tokio::test]
+    async fn test_get_range_file_path_rejects_malformed() {
+        // Validates: Requirements 3.2, 5.6
+        let temp_dir = TempDir::new().unwrap();
+        let journal_manager = Arc::new(JournalManager::new(
+            temp_dir.path().to_path_buf(),
+            "test-instance".to_string(),
+        ));
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            temp_dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            3,
+        ));
+        let consolidator = JournalConsolidator::new(
+            temp_dir.path().to_path_buf(),
+            journal_manager,
+            lock_manager,
+            ConsolidationConfig::default(),
+        );
+
+        let range_spec = create_test_range_spec(0, 100);
+        let result = consolidator.get_range_file_path("noslash", &range_spec);
+        assert!(result.is_err(), "Malformed cache key must return Err, got Ok");
+    }
 }

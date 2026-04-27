@@ -6893,6 +6893,40 @@ pub struct CacheCleanupStats {
 /// assert_eq!(object_key, "path/to/object");
 /// ```
 ///
+/// Validate that a bucket segment is safe to use as a filesystem directory name.
+///
+/// Rejects:
+/// - `.` or `..` (path traversal)
+/// - Empty strings (already rejected upstream but defensive)
+/// - Strings containing `/`, `\`, or NUL (path separators and string terminators)
+/// - Strings containing any ASCII control character (0x00–0x1F, 0x7F)
+///
+/// Does NOT enforce the S3 bucket naming rules (lowercase, length) — the
+/// proxy forwards to S3, and S3 will reject invalid bucket names. We only
+/// enforce what is needed to keep cache paths inside the cache directory.
+fn validate_bucket_segment(bucket: &str) -> Result<()> {
+    if bucket.is_empty() {
+        return Err(ProxyError::CacheError(
+            "Invalid cache key: empty bucket segment".to_string(),
+        ));
+    }
+    if bucket == "." || bucket == ".." {
+        return Err(ProxyError::CacheError(format!(
+            "Invalid cache key: bucket segment '{}' is not allowed",
+            bucket
+        )));
+    }
+    for b in bucket.bytes() {
+        if b == b'/' || b == b'\\' || b < 0x20 || b == 0x7F {
+            return Err(ProxyError::CacheError(format!(
+                "Invalid cache key: bucket segment '{}' contains an invalid byte (0x{:02X})",
+                bucket, b
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// # Requirements
 /// Implements Requirements 1.2, 5.2
 pub fn parse_cache_key(cache_key: &str) -> Result<(&str, &str)> {
@@ -6908,10 +6942,13 @@ pub fn parse_cache_key(cache_key: &str) -> Result<(&str, &str)> {
         ))
     })?;
 
-    // Validate that both bucket and object_key are non-empty
-    if bucket.is_empty() || object_key.is_empty() {
+    // Reject bucket segments that would escape the cache directory or contain
+    // unsafe bytes (handles empty, `.`, `..`, path separators, control chars).
+    validate_bucket_segment(bucket)?;
+
+    if object_key.is_empty() {
         return Err(ProxyError::CacheError(format!(
-            "Invalid cache key format: '{}'. Bucket and object key must be non-empty",
+            "Invalid cache key format: '{}'. Object key must be non-empty",
             cache_key
         )));
     }
@@ -7199,6 +7236,55 @@ mod tests {
 
         // Test only bucket with trailing slash
         let result = parse_cache_key("bucket/");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cache_key_rejects_dotdot() {
+        // Validates: Requirements 2.1, 5.3
+        let result = parse_cache_key("../etc/passwd");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains(".."));
+    }
+
+    #[test]
+    fn test_parse_cache_key_rejects_single_dot() {
+        // Validates: Requirements 2.1, 5.4
+        let result = parse_cache_key("./bucket/key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cache_key_rejects_nul() {
+        // Validates: Requirements 2.3, 5.5
+        let result = parse_cache_key("bu\0cket/key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cache_key_rejects_control_chars() {
+        // Validates: Requirements 2.3
+        let result = parse_cache_key("bu\x01cket/key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cache_key_accepts_s3_valid_names() {
+        // Validates: Requirements 2.6
+        let (bucket, object_key) =
+            parse_cache_key("my-bucket.v2/path/to/key").unwrap();
+        assert_eq!(bucket, "my-bucket.v2");
+        assert_eq!(object_key, "path/to/key");
+    }
+
+    #[test]
+    fn test_get_sharded_path_stays_within_base() {
+        // Validates: Requirements 2.4
+        let tmp = TempDir::new().unwrap();
+        let result = get_sharded_path(tmp.path(), "../foo/key", ".meta");
         assert!(result.is_err());
     }
 

@@ -361,7 +361,7 @@ impl MetadataLockManager {
     }
     /// Acquire an exclusive metadata lock with stale lock detection and exponential backoff
     pub async fn acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
-        let lock_file_path = self.get_lock_file_path(cache_key);
+        let lock_file_path = self.get_lock_file_path(cache_key)?;
         let mut attempt = 0;
 
         // Ensure parent directory exists
@@ -414,7 +414,7 @@ impl MetadataLockManager {
     /// with exponential backoff. Used by journal consolidation where skipping a
     /// contended key and retrying next cycle is cheaper than waiting.
     pub async fn try_acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
-        let lock_file_path = self.get_lock_file_path(cache_key);
+        let lock_file_path = self.get_lock_file_path(cache_key)?;
 
         // Ensure parent directory exists
         if let Some(parent) = lock_file_path.parent() {
@@ -704,29 +704,24 @@ impl MetadataLockManager {
         }
     }
     /// Get lock file path for a cache key
-    fn get_lock_file_path(&self, cache_key: &str) -> PathBuf {
+    ///
+    /// Returns `ProxyError::CacheError` if `cache_key` is malformed (missing
+    /// `bucket/object` separator or containing a rejected bucket segment).
+    fn get_lock_file_path(&self, cache_key: &str) -> Result<PathBuf> {
         // Use the same path structure as metadata files
-        let metadata_path = self.get_metadata_file_path(cache_key);
-        metadata_path.with_extension("meta.lock")
+        let metadata_path = self.get_metadata_file_path(cache_key)?;
+        Ok(metadata_path.with_extension("meta.lock"))
     }
 
     /// Get metadata file path for a cache key
     ///
-    /// # Panics
-    /// Panics if cache_key is malformed (missing bucket/object separator).
-    fn get_metadata_file_path(&self, cache_key: &str) -> PathBuf {
+    /// Returns `ProxyError::CacheError` if `cache_key` is malformed (missing
+    /// `bucket/object` separator or containing a rejected bucket segment).
+    /// Callers in request-handling paths should propagate via `?`; callers in
+    /// background loops should log at WARN level and skip the entry.
+    fn get_metadata_file_path(&self, cache_key: &str) -> Result<PathBuf> {
         let base_dir = self.cache_dir.join("metadata");
-
-        // Use the same sharding logic as DiskCacheManager for consistency
-        match crate::disk_cache::get_sharded_path(&base_dir, cache_key, ".meta") {
-            Ok(path) => path,
-            Err(e) => {
-                panic!(
-                    "Malformed cache key '{}': {}. Cache keys must be in 'bucket/object' format.",
-                    cache_key, e
-                );
-            }
-        }
+        crate::disk_cache::get_sharded_path(&base_dir, cache_key, ".meta")
     }
 
     /// Calculate exponential backoff with jitter
@@ -1245,5 +1240,16 @@ mod tests {
         }
 
         TestResult::passed()
+    }
+
+    #[tokio::test]
+    async fn test_get_metadata_file_path_rejects_malformed() {
+        // Validates: Requirements 3.4, 5.6
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
+
+        let result = manager.get_metadata_file_path("noslash");
+        assert!(result.is_err(), "Malformed cache key must return Err, got Ok");
     }
 }

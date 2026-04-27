@@ -399,7 +399,7 @@ impl HybridMetadataWriter {
         _lock: &MetadataLock,
         ttl: std::time::Duration,
     ) -> Result<NewCacheMetadata> {
-        let metadata_path = self.get_metadata_file_path(cache_key);
+        let metadata_path = self.get_metadata_file_path(cache_key)?;
 
         if metadata_path.exists() {
             // Load existing metadata
@@ -466,7 +466,7 @@ impl HybridMetadataWriter {
         metadata: &NewCacheMetadata,
         _lock: &MetadataLock,
     ) -> Result<()> {
-        let metadata_path = self.get_metadata_file_path(&metadata.cache_key);
+        let metadata_path = self.get_metadata_file_path(&metadata.cache_key)?;
 
         // Ensure parent directory exists
         if let Some(parent) = metadata_path.parent() {
@@ -549,7 +549,7 @@ impl HybridMetadataWriter {
         let mut cleanup_errors = Vec::new();
 
         // Clean up metadata temp files (both old .meta.tmp and new instance-specific patterns)
-        let metadata_path = self.get_metadata_file_path(cache_key);
+        let metadata_path = self.get_metadata_file_path(cache_key)?;
 
         // Clean up old-style .meta.tmp
         let metadata_temp_path = metadata_path.with_extension("meta.tmp");
@@ -660,23 +660,17 @@ impl HybridMetadataWriter {
         Ok(())
     }
 
-    /// Get metadata file path for a cache key
+    /// Get metadata file path for a cache key.
     ///
-    /// # Panics
-    /// Panics if cache_key is malformed (missing bucket/object separator).
-    fn get_metadata_file_path(&self, cache_key: &str) -> PathBuf {
+    /// Returns `Err(ProxyError::CacheError)` if the cache key is malformed
+    /// (e.g., missing bucket/object separator, or contains path-traversing
+    /// segments). Callers in request-handling paths should propagate via `?`;
+    /// callers in background loops should log at WARN level and skip the entry.
+    fn get_metadata_file_path(&self, cache_key: &str) -> Result<PathBuf> {
         let base_dir = self.cache_dir.join("metadata");
 
         // Use the same sharding logic as DiskCacheManager for consistency
-        match crate::disk_cache::get_sharded_path(&base_dir, cache_key, ".meta") {
-            Ok(path) => path,
-            Err(e) => {
-                panic!(
-                    "Malformed cache key '{}': {}. Cache keys must be in 'bucket/object' format.",
-                    cache_key, e
-                );
-            }
-        }
+        crate::disk_cache::get_sharded_path(&base_dir, cache_key, ".meta")
     }
 
     /// Get instance ID for journal entries
@@ -824,7 +818,7 @@ mod tests {
             .unwrap();
 
         // Verify metadata file was created
-        let metadata_path = writer.get_metadata_file_path(cache_key);
+        let metadata_path = writer.get_metadata_file_path(cache_key).unwrap();
         assert!(metadata_path.exists());
 
         // Verify metadata content
@@ -853,5 +847,31 @@ mod tests {
         let sanitized = sanitize_cache_key_for_filename(&long_key);
         assert!(sanitized.starts_with("long_key_"));
         assert!(sanitized.len() < 200);
+    }
+
+    #[tokio::test]
+    async fn test_get_metadata_file_path_rejects_malformed() {
+        // Validates: Requirements 3.3, 5.6
+        let temp_dir = TempDir::new().unwrap();
+        let lock_manager = Arc::new(MetadataLockManager::new(
+            temp_dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            3,
+        ));
+        let journal_manager = Arc::new(JournalManager::new(
+            temp_dir.path().to_path_buf(),
+            "test-instance".to_string(),
+        ));
+        let consolidation_trigger = Arc::new(ConsolidationTrigger::new(1024, 10));
+
+        let writer = HybridMetadataWriter::new(
+            temp_dir.path().to_path_buf(),
+            lock_manager,
+            journal_manager,
+            consolidation_trigger,
+        );
+
+        let result = writer.get_metadata_file_path("noslash");
+        assert!(result.is_err(), "Malformed cache key must return Err, got Ok");
     }
 }

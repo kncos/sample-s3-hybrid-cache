@@ -163,34 +163,41 @@ pub fn decode_aws_chunked(body: &[u8]) -> Result<Vec<u8>, AwsChunkedError> {
 
         // If chunk size is 0, we've reached the final chunk
         if chunk_size == 0 {
-            // Skip the final \r\n after the zero-length chunk
-            if pos < body.len() && body.len() >= pos + 2 {
-                // Verify trailing \r\n exists
-                if body[pos..].starts_with(b"\r\n") {
+            // Skip the final \r\n after the zero-length chunk.
+            // Use checked_add so a crafted `pos` cannot overflow usize.
+            if let Some(end) = pos.checked_add(2) {
+                if end <= body.len() && body[pos..].starts_with(b"\r\n") {
                     // Successfully parsed
                 }
             }
             break;
         }
 
-        // Read chunk data
-        if pos + chunk_size > body.len() {
+        // Read chunk data — reject overflow as EOF so a `chunk_size` near
+        // `usize::MAX` cannot wrap past `body.len()` and panic on slice.
+        let chunk_end = pos
+            .checked_add(chunk_size)
+            .ok_or(AwsChunkedError::UnexpectedEof)?;
+        if chunk_end > body.len() {
             return Err(AwsChunkedError::UnexpectedEof);
         }
 
-        result.extend_from_slice(&body[pos..pos + chunk_size]);
-        pos += chunk_size;
+        result.extend_from_slice(&body[pos..chunk_end]);
+        pos = chunk_end;
 
-        // Skip trailing \r\n after chunk data
-        if pos + 2 > body.len() {
+        // Skip trailing \r\n after chunk data — reject overflow as EOF.
+        let trailer_end = pos
+            .checked_add(2)
+            .ok_or(AwsChunkedError::UnexpectedEof)?;
+        if trailer_end > body.len() {
             return Err(AwsChunkedError::UnexpectedEof);
         }
-        if &body[pos..pos + 2] != b"\r\n" {
+        if &body[pos..trailer_end] != b"\r\n" {
             return Err(AwsChunkedError::InvalidChunkHeader(
                 "Missing CRLF after chunk data".to_string(),
             ));
         }
-        pos += 2;
+        pos = trailer_end;
     }
 
     Ok(result)
@@ -273,6 +280,7 @@ pub fn encode_aws_chunked(data: &[u8], chunk_size: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quickcheck_macros::quickcheck;
 
     #[test]
     fn test_is_aws_chunked_with_content_encoding() {
@@ -379,5 +387,43 @@ mod tests {
         let truncated = b"5;chunk-signature=abc\r\nHel";
         let result = decode_aws_chunked(truncated);
         assert!(matches!(result, Err(AwsChunkedError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn test_decode_rejects_usize_max_chunk_size() {
+        // `ffffffffffffffff` == usize::MAX on 64-bit targets. Prior to the
+        // checked_add guard, `pos + chunk_size` would wrap past body.len()
+        // and the slice index would panic. Now it must return Err cleanly.
+        let body: &[u8] = b"ffffffffffffffff;chunk-signature=0\r\n";
+        let result = decode_aws_chunked(body);
+        assert!(
+            result.is_err(),
+            "expected Err for usize::MAX chunk size, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_decode_rejects_near_usize_max_chunk_size() {
+        // One less than usize::MAX: still guaranteed to overflow `pos + 2`
+        // trailing CRLF check on any realistic body length.
+        let body: &[u8] = b"fffffffffffffffe;chunk-signature=0\r\n";
+        let result = decode_aws_chunked(body);
+        assert!(
+            result.is_err(),
+            "expected Err for near-usize::MAX chunk size, got {:?}",
+            result
+        );
+    }
+
+    // Validates: Requirements 5.7
+    //
+    // Property: for any Vec<u8>, decode_aws_chunked returns Ok(_) or Err(_)
+    // without panicking. A panic here would abort the test process, so merely
+    // completing the call is sufficient evidence.
+    #[quickcheck]
+    fn prop_decode_never_panics(body: Vec<u8>) -> bool {
+        let _ = decode_aws_chunked(&body);
+        true
     }
 }

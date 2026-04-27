@@ -2795,7 +2795,6 @@ impl CacheManager {
                     } else {
                         entry_data
                     };
-                    let data_len = data.len();
 
                     drop(inner); // Release lock before updating statistics
                     debug!("Range cache hit (RAM) for {}-{}", range.start, range.end);

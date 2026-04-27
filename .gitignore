@@ -1,2 +1,29 @@
-src/.DS_Store
+# Rust build artifacts
+/target
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Temporary test/debug files
+*.tmp
+*.bak
+
+# Coverage reports
+coverage/
+*.profraw
+*.profdata
+
+# Logs
+*.log
+
+# Cache / runtime data
+cache/
+tmp/

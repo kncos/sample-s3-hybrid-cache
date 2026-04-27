@@ -938,29 +938,100 @@ impl HttpProxy {
         }
     }
 
-    /// Validate Host header and extract hostname (strips port if present)
+    /// Parse a Host header value into its hostname component, stripping any port.
+    ///
+    /// Handles all RFC 7230 / RFC 3986 forms:
+    ///   example.com
+    ///   example.com:8080
+    ///   127.0.0.1:80
+    ///   [::1]
+    ///   [::1]:8081
+    ///   [2001:db8::1]:443
+    ///
+    /// Returns the unbracketed hostname (e.g. `::1`, not `[::1]`) so downstream
+    /// code sees a consistent shape regardless of address family. Returns an
+    /// error for malformed inputs: unclosed brackets, stray `]` without `[`,
+    /// or bare strings with multiple colons (ambiguous with unbracketed
+    /// IPv6, which is not legal in a Host header per RFC 3986).
+    fn parse_host_header(value: &str) -> std::result::Result<&str, &'static str> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("empty Host header");
+        }
+
+        if let Some(rest) = value.strip_prefix('[') {
+            // Bracketed IPv6. Require a matching ']'.
+            let end = rest.find(']').ok_or("missing ']' in bracketed IPv6 host")?;
+            let host = &rest[..end];
+            if host.is_empty() {
+                return Err("empty bracketed host");
+            }
+            // After ']', either nothing or ':<port>' is permitted.
+            let after = &rest[end + 1..];
+            if !after.is_empty() && !after.starts_with(':') {
+                return Err("unexpected characters after ']' in Host header");
+            }
+            // Port validation is best-effort: reject obviously broken port strings
+            // so a bad Host header doesn't masquerade as a valid bracketed host.
+            if let Some(port_str) = after.strip_prefix(':') {
+                if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                    return Err("invalid port in Host header");
+                }
+            }
+            return Ok(host);
+        }
+
+        if value.contains(']') {
+            return Err("stray ']' in Host header");
+        }
+
+        // No brackets. At most one colon is allowed (hostname:port or ipv4:port).
+        // Unbracketed IPv6 is not legal in a Host header.
+        match value.rsplit_once(':') {
+            Some((host, port_str)) => {
+                if host.contains(':') {
+                    return Err("unbracketed IPv6 in Host header");
+                }
+                if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                    return Err("invalid port in Host header");
+                }
+                Ok(host)
+            }
+            None => Ok(value),
+        }
+    }
+
+    /// Validate Host header and extract hostname (strips port if present).
+    ///
+    /// Uses `parse_host_header` to correctly handle bracketed IPv6 literals
+    /// (e.g., `[::1]:8081` → `::1`) per RFC 3986 §3.2.2.
     fn validate_host_header(
         req: &Request<hyper::body::Incoming>,
     ) -> std::result::Result<String, Response<BoxBody<Bytes, hyper::Error>>> {
         match req.headers().get("host") {
-            Some(host_header) => {
-                match host_header.to_str() {
-                    Ok(host_with_port) => {
-                        // Strip port from host if present (e.g., "s3.amazonaws.com:8081" -> "s3.amazonaws.com")
-                        let host = host_with_port.split(':').next().unwrap_or(host_with_port);
-                        Ok(host.to_string())
-                    }
-                    Err(_) => {
-                        warn!("Invalid Host header encoding");
+            Some(host_header) => match host_header.to_str() {
+                Ok(raw) => match Self::parse_host_header(raw) {
+                    Ok(host) => Ok(host.to_string()),
+                    Err(reason) => {
+                        warn!("Invalid Host header: {} ({})", raw, reason);
                         Err(Self::build_error_response(
                             StatusCode::BAD_REQUEST,
                             "InvalidRequest",
-                            "Invalid Host header encoding.",
+                            "Invalid Host header.",
                             None,
                         ))
                     }
+                },
+                Err(_) => {
+                    warn!("Invalid Host header encoding");
+                    Err(Self::build_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Invalid Host header encoding.",
+                        None,
+                    ))
                 }
-            }
+            },
             None => {
                 warn!("Missing Host header");
                 Err(Self::build_error_response(
@@ -2712,6 +2783,37 @@ impl HttpProxy {
                     .boxed(),
             )
             .unwrap()
+    }
+
+    /// Map a `ProxyError` to an S3-compatible HTTP error response.
+    ///
+    /// This is the canonical conversion used by request handlers when a cache-layer
+    /// error should surface to the client. The mapping matches S3 error semantics:
+    ///
+    /// - `ProxyError::CacheError` → HTTP 400 `InvalidArgument` (malformed cache key,
+    ///   e.g. path traversal attempts rejected by `parse_cache_key`). These are
+    ///   deterministic client errors — retrying will not help (Requirement 4.3),
+    ///   so we return a terminal 4xx rather than falling through to S3.
+    /// - All other variants → HTTP 500 `InternalError` as a safe default.
+    #[allow(dead_code)]
+    fn proxy_error_to_response(
+        err: &crate::ProxyError,
+    ) -> Response<BoxBody<Bytes, hyper::Error>> {
+        use crate::ProxyError;
+        match err {
+            ProxyError::CacheError(msg) => Self::build_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                msg,
+                None,
+            ),
+            other => Self::build_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &other.to_string(),
+                None,
+            ),
+        }
     }
 
     /// Read request body into bytes
@@ -8167,5 +8269,103 @@ mod tests {
         }
 
         TestResult::passed()
+    }
+
+    // ------------------------------------------------------------------
+    // parse_host_header tests (Task 5.5)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_host_header_ipv6_with_port() {
+        // Validates: Requirements 6.2, 5.8
+        assert_eq!(HttpProxy::parse_host_header("[::1]:8081").unwrap(), "::1");
+    }
+
+    #[test]
+    fn test_parse_host_header_ipv6_no_port() {
+        // Validates: Requirements 6.1, 5.8
+        assert_eq!(HttpProxy::parse_host_header("[::1]").unwrap(), "::1");
+    }
+
+    #[test]
+    fn test_parse_host_header_ipv6_long() {
+        // Validates: Requirements 6.2, 5.8
+        assert_eq!(
+            HttpProxy::parse_host_header("[2001:db8::1]:443").unwrap(),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn test_parse_host_header_hostname_with_port() {
+        // Validates: Requirements 6.4, 5.8
+        assert_eq!(
+            HttpProxy::parse_host_header("example.com:8080").unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn test_parse_host_header_hostname_no_port() {
+        // Validates: Requirements 6.3, 5.8
+        assert_eq!(
+            HttpProxy::parse_host_header("example.com").unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn test_parse_host_header_ipv4_with_port() {
+        // Validates: Requirements 6.5, 5.8
+        assert_eq!(
+            HttpProxy::parse_host_header("127.0.0.1:80").unwrap(),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn test_parse_host_header_rejects_unclosed_bracket() {
+        // Validates: Requirements 6.6, 5.9
+        assert!(HttpProxy::parse_host_header("[::1").is_err());
+    }
+
+    #[test]
+    fn test_parse_host_header_rejects_stray_close_bracket() {
+        // Validates: Requirements 6.7
+        assert!(HttpProxy::parse_host_header("::1]").is_err());
+    }
+
+    #[test]
+    fn test_parse_host_header_rejects_unbracketed_ipv6() {
+        // Validates: Requirements 6.6
+        assert!(HttpProxy::parse_host_header("::1").is_err());
+    }
+
+    #[test]
+    fn test_parse_host_header_rejects_nonnumeric_port() {
+        // Validates: Requirements 6.8
+        assert!(HttpProxy::parse_host_header("example.com:abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_host_header_rejects_empty() {
+        // Validates: Requirements 6.9
+        assert!(HttpProxy::parse_host_header("").is_err());
+    }
+
+    #[test]
+    fn test_parse_host_header_hostname_only() {
+        // Validates: Requirements 6.10 (well-formed non-colon hostname)
+        assert_eq!(
+            HttpProxy::parse_host_header("simple-host").unwrap(),
+            "simple-host"
+        );
+    }
+
+    #[quickcheck]
+    fn prop_parse_host_header_never_panics(value: String) -> bool {
+        // Validates: Requirements 5.9
+        let _ = HttpProxy::parse_host_header(&value);
+        true
     }
 }

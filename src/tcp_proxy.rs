@@ -7,7 +7,6 @@
 use crate::connection_pool::EndpointOverrides;
 use crate::{ProxyError, Result};
 use std::net::{IpAddr, SocketAddr};
-use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
