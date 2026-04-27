@@ -59,6 +59,8 @@ async fn create_test_size_tracker(
         validation_time_of_day: "00:00".to_string(),
         validation_enabled: true,
         incomplete_upload_ttl: Duration::from_secs(86400),
+        validation_max_duration: Duration::from_secs(4 * 3600),
+        ..Default::default()
     };
 
     let tracker = Arc::new(

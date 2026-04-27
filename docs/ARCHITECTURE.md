@@ -349,8 +349,10 @@ Each instance operates independently - the shared storage is the only integratio
 
 **Recovery**:
 - On startup, consolidator loads `size_state.json`
-- If missing, starts at 0 and daily validation will correct
+- If missing, starts at 0 and the periodic validation scan will correct
 - In-memory accumulator starts at zero; delta files are summed on next consolidation cycle
+
+**Periodic validation scan**: A background scan (default every 24h) walks cached metadata to reconcile tracked size with actual disk usage. The scan automatically switches between *full* mode (all L1 shard directories in parallel) and *rolling* mode (subset per cycle, resumed from a persistent cursor) based on observed duration vs. the `validation_max_duration` budget (default 4h). Large caches that exceed the budget run in rolling mode and achieve full coverage over multiple daily cycles. See [CONFIGURATION.md - Validation Scan](CONFIGURATION.md#validation-scan).
 
 ## Request Flow
 

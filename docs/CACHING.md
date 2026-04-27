@@ -585,7 +585,7 @@ cache_dir/
 └── size_tracking/              # Cache size tracking files
     ├── size_state.json        # Authoritative size state (updated by consolidator)
     ├── delta_{instance_id}.json  # Per-instance delta files (flushed every 5s)
-    ├── validation.json        # Validation metadata
+    ├── validation.json        # Validation scan state (mode, cursor, scan rate — see CONFIGURATION.md#validation-scan)
     └── validation.lock        # Validation lock file
 ```
 

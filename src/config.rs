@@ -544,6 +544,17 @@ pub struct SharedStorageConfig {
     /// Valid range: 10-1000
     #[serde(default = "default_orphan_max_per_cycle")]
     pub orphan_max_per_cycle: usize,
+
+    /// Maximum duration for a single validation scan cycle (default: 4h)
+    /// This is the single knob for self-tuning mode selection:
+    /// - Full scan that exceeds this → switch to rolling next cycle
+    /// - Rolling scan that extrapolates full time ≤ this → switch back to full
+    /// Valid range: 10 minutes - 23 hours
+    #[serde(
+        default = "default_validation_max_duration",
+        deserialize_with = "duration_serde::deserialize"
+    )]
+    pub validation_max_duration: Duration,
 }
 
 fn default_shared_storage_lock_timeout() -> Duration {
@@ -576,6 +587,10 @@ fn default_orphan_max_per_cycle() -> usize {
     100
 }
 
+fn default_validation_max_duration() -> Duration {
+    Duration::from_secs(4 * 3600) // 4 hours
+}
+
 impl Default for SharedStorageConfig {
     fn default() -> Self {
         Self {
@@ -594,6 +609,7 @@ impl Default for SharedStorageConfig {
             orphan_recovery_interval: default_orphan_recovery_interval(),
             orphan_scan_timeout: default_orphan_scan_timeout(),
             orphan_max_per_cycle: default_orphan_max_per_cycle(),
+            validation_max_duration: default_validation_max_duration(),
         }
     }
 }
@@ -696,6 +712,21 @@ impl SharedStorageConfig {
             return Err(format!(
                 "eviction_lock_timeout must be between 30 and 3600 seconds, got {}",
                 eviction_lock_timeout_secs
+            ));
+        }
+
+        // Validate validation_max_duration (10 minutes - 23 hours)
+        let max_duration_secs = self.validation_max_duration.as_secs();
+        if max_duration_secs < 10 * 60 {
+            return Err(format!(
+                "validation_max_duration must be at least 10 minutes (600 seconds), got {}s",
+                max_duration_secs
+            ));
+        }
+        if max_duration_secs > 23 * 3600 {
+            return Err(format!(
+                "validation_max_duration must be at most 23 hours (82800 seconds), got {}s",
+                max_duration_secs
             ));
         }
 
@@ -3791,6 +3822,7 @@ idle_timeout: "30s"
         assert_eq!(config.lock_refresh_interval, Duration::from_secs(30));
         assert_eq!(config.validation_threshold_warn, 5.0);
         assert_eq!(config.validation_threshold_error, 20.0);
+        assert_eq!(config.validation_max_duration, Duration::from_secs(4 * 3600));
     }
 
     #[test]
@@ -3843,6 +3875,74 @@ idle_timeout: "30s"
             ..SharedStorageConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_max_duration_defaults_to_4_hours() {
+        let config = SharedStorageConfig::default();
+        assert_eq!(config.validation_max_duration, Duration::from_secs(4 * 3600));
+    }
+
+    #[test]
+    fn test_validation_max_duration_validation_rejects_too_short() {
+        // Less than 10 minutes should be rejected
+        let config = SharedStorageConfig {
+            validation_max_duration: Duration::from_secs(5 * 60), // 5 minutes
+            ..SharedStorageConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        // Exactly 9 minutes 59 seconds should be rejected
+        let config = SharedStorageConfig {
+            validation_max_duration: Duration::from_secs(599),
+            ..SharedStorageConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_max_duration_validation_rejects_too_long() {
+        // More than 23 hours should be rejected
+        let config = SharedStorageConfig {
+            validation_max_duration: Duration::from_secs(24 * 3600), // 24 hours
+            ..SharedStorageConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        // 23 hours + 1 second should be rejected
+        let config = SharedStorageConfig {
+            validation_max_duration: Duration::from_secs(23 * 3600 + 1),
+            ..SharedStorageConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_max_duration_validation_accepts_valid_values() {
+        // Exactly 10 minutes (lower bound)
+        let config = SharedStorageConfig {
+            validation_max_duration: Duration::from_secs(10 * 60),
+            ..SharedStorageConfig::default()
+        };
+        assert!(config.validate().is_ok());
+
+        // Exactly 23 hours (upper bound)
+        let config = SharedStorageConfig {
+            validation_max_duration: Duration::from_secs(23 * 3600),
+            ..SharedStorageConfig::default()
+        };
+        assert!(config.validate().is_ok());
+
+        // 4 hours (default)
+        let config = SharedStorageConfig::default();
+        assert!(config.validate().is_ok());
+
+        // 1 hour
+        let config = SharedStorageConfig {
+            validation_max_duration: Duration::from_secs(3600),
+            ..SharedStorageConfig::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -5557,5 +5657,50 @@ mod tls_config_property_tests {
         } else {
             TestResult::from_bool(result.is_ok())
         }
+    }
+}
+
+/// Property-based tests for rolling validation scan configuration
+#[cfg(test)]
+mod rolling_validation_config_property_tests {
+    use super::*;
+    use quickcheck::TestResult;
+    use quickcheck_macros::quickcheck;
+
+    /// **Feature: rolling-validation-scan, Property 2: Configuration validation rejects out-of-range values**
+    ///
+    /// *For any* `validation_max_duration` value less than 10 minutes or greater than 23 hours,
+    /// `SharedStorageConfig::validate()` SHALL return an error. *For any* values within the valid
+    /// range, validation SHALL succeed (assuming all other config fields are valid).
+    ///
+    /// **Validates: Requirements 2.2, 2.3**
+    #[quickcheck]
+    fn prop_validation_max_duration_rejects_out_of_range(secs: u64, force_invalid: bool) -> TestResult {
+        const MIN_SECS: u64 = 10 * 60;      // 10 minutes
+        const MAX_SECS: u64 = 23 * 3600;     // 23 hours
+
+        let duration_secs = if force_invalid {
+            // Generate an invalid value: either below min or above max
+            if secs % 2 == 0 {
+                // Below minimum: 0 to MIN_SECS-1
+                secs % MIN_SECS
+            } else {
+                // Above maximum: MAX_SECS+1 to MAX_SECS+100000
+                MAX_SECS + 1 + (secs % 100_000)
+            }
+        } else {
+            // Generate a valid value: MIN_SECS to MAX_SECS
+            MIN_SECS + (secs % (MAX_SECS - MIN_SECS + 1))
+        };
+
+        let config = SharedStorageConfig {
+            validation_max_duration: Duration::from_secs(duration_secs),
+            ..SharedStorageConfig::default()
+        };
+
+        let result = config.validate();
+        let is_valid = duration_secs >= MIN_SECS && duration_secs <= MAX_SECS;
+
+        TestResult::from_bool(result.is_ok() == is_valid)
     }
 }

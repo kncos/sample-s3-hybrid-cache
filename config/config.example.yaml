@@ -189,6 +189,15 @@ cache:
     # Valid range: 1-168 hours
     validation_frequency: "23h"
   
+    # Maximum duration for a single validation scan cycle (default: 4h).
+    # This is the single knob for self-tuning mode selection:
+    # - If a full scan exceeds this budget, the next cycle switches to rolling mode
+    # - Rolling mode processes a subset of directories per cycle and resumes next time
+    # - When rolling mode estimates a full scan would fit within this budget, it switches back
+    # Valid range: 10 minutes ("10m") to 23 hours ("23h")
+    # Default: "4h"
+    validation_max_duration: "4h"
+  
   # ============================================================================
   # DOWNLOAD COORDINATION CONFIGURATION
   # ============================================================================

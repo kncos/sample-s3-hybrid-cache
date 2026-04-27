@@ -16,6 +16,7 @@ Complete configuration guide for S3 Proxy including cache behavior, TTL manageme
 - [Range Request Optimization](#range-request-optimization)
 - [Eviction Configuration](#eviction-configuration)
 - [Multi-Instance Coordination](#multi-instance-coordination)
+  - [Validation Scan](#validation-scan)
 - [Cache Size Tracking Configuration](#cache-size-tracking-configuration)
 - [Compression Configuration](#compression-configuration)
 - [Connection Pooling](#connection-pooling)
@@ -748,6 +749,7 @@ cache:
     lock_refresh_interval: "30s"
     consolidation_interval: "5s"
     validation_frequency: "24h"
+    validation_max_duration: "4h"
     validation_threshold_warn: 5.0
     validation_threshold_error: 20.0
     eviction_lock_timeout: "60s"
@@ -790,7 +792,41 @@ nfs-server.example.com:/export/cache /mnt/cache nfs4 nfsvers=4.1,rsize=1048576,w
 | `lock_timeout` | Max wait for file locks | Small cache: 60s, Large cache: 300-600s |
 | `consolidation_interval` | Journal flush frequency | 5s (default), reduce for faster consistency |
 | `validation_frequency` | Consistency check interval | 24h (default), increase for large deployments |
+| `validation_max_duration` | Time budget for validation scan | 4h (default). Controls automatic full↔rolling mode switching |
 | `eviction_lock_timeout` | Distributed eviction timeout | Match lock_timeout for consistency |
+
+### Validation Scan
+
+The proxy runs a periodic validation scan (every `validation_frequency`, default 24h) that walks cached metadata to reconcile tracked cache size with actual disk usage. The scan automatically selects between two modes based on observed duration:
+
+**Full mode**: Scans all 256 L1 shard directories in parallel. Used on first scan and when the previous scan completed within the time budget.
+
+**Rolling mode**: Scans a subset of L1 directories per cycle, resuming from a persistent cursor on the next invocation. Full coverage is achieved over multiple daily cycles. Activated automatically when a full scan exceeds `validation_max_duration`.
+
+**Mode selection rules**:
+- No previous scan history → full scan
+- Previous full scan exceeded `validation_max_duration` → switch to rolling
+- Previous full scan within budget → stay in full
+- Previous rolling scan, extrapolated full time > budget → stay in rolling
+- Previous rolling scan, extrapolated full time ≤ budget → switch back to full
+
+**Configuration**:
+
+```yaml
+cache:
+  shared_storage:
+    validation_max_duration: "4h"  # Default: 4 hours. Valid range: 10m – 23h
+```
+
+This is the single knob for self-tuning mode selection. The proxy adapts automatically — no manual mode switching is needed.
+
+**Rolling scan behavior**:
+- Adaptive batch sizing: uses the previous cycle's scan rate (seconds per L1 directory) to estimate how many directories fit within the time budget. First cycle defaults to 64 directories.
+- Proportional size correction: adjusts tracked cache size by the observed drift in the scanned subset rather than replacing the full total, avoiding large swings from partial scans.
+- Cursor persistence: the current position, scan rate, and rotation count are stored in `validation.json`. If the file is missing or corrupted, the cursor resets to 0.
+- Full rotation tracking: when the cursor wraps past all 256 directories, a rotation completion is logged with elapsed time.
+
+**Monitoring**: Check `journalctl -u s3-proxy` for validation scan logs. The proxy logs the selected mode, reason, time budget, directories scanned, objects validated, scan rate, and cursor position at INFO level.
 
 ## Cache Size Tracking Configuration
 

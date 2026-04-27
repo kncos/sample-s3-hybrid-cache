@@ -136,6 +136,8 @@ async fn test_validation_removes_unparseable_metadata_files() {
         validation_time_of_day: "00:00".to_string(),
         validation_enabled: true,
         incomplete_upload_ttl: Duration::from_secs(86400), // 1 day
+        validation_max_duration: Duration::from_secs(4 * 3600),
+        ..Default::default()
     };
 
     let tracker = CacheSizeTracker::new(cache_dir.clone(), config, false, consolidator)

@@ -3626,6 +3626,8 @@ mod tests {
             validation_time_of_day: "00:00".to_string(),
             validation_enabled: true,
             incomplete_upload_ttl: Duration::from_secs(86400),
+            validation_max_duration: Duration::from_secs(4 * 3600),
+            ..Default::default()
         };
         let size_tracker = Arc::new(
             CacheSizeTracker::new(cache_dir, size_config, false, consolidator)
@@ -3709,6 +3711,8 @@ mod tests {
             validation_time_of_day: "00:00".to_string(),
             validation_enabled: true,
             incomplete_upload_ttl: Duration::from_secs(86400),
+            validation_max_duration: Duration::from_secs(4 * 3600),
+            ..Default::default()
         };
         let size_tracker = Arc::new(
             CacheSizeTracker::new(cache_dir, size_config, false, consolidator)
@@ -3793,6 +3797,8 @@ mod tests {
             validation_time_of_day: "00:00".to_string(),
             validation_enabled: true,
             incomplete_upload_ttl: Duration::from_secs(86400),
+            validation_max_duration: Duration::from_secs(4 * 3600),
+            ..Default::default()
         };
         let size_tracker = Arc::new(
             CacheSizeTracker::new(cache_dir, size_config, false, consolidator)
@@ -3859,6 +3865,8 @@ mod tests {
             validation_time_of_day: "00:00".to_string(),
             validation_enabled: true,
             incomplete_upload_ttl: Duration::from_secs(86400),
+            validation_max_duration: Duration::from_secs(4 * 3600),
+            ..Default::default()
         };
         let size_tracker = Arc::new(
             CacheSizeTracker::new(cache_dir, size_config, false, consolidator)
@@ -3981,6 +3989,8 @@ mod tests {
             validation_time_of_day: "00:00".to_string(),
             validation_enabled: true,
             incomplete_upload_ttl: Duration::from_secs(86400),
+            validation_max_duration: Duration::from_secs(4 * 3600),
+            ..Default::default()
         };
         let size_tracker = Arc::new(
             CacheSizeTracker::new(cache_dir, size_config, false, consolidator)
@@ -4253,6 +4263,8 @@ mod tests {
             validation_time_of_day: "00:00".to_string(),
             validation_enabled: true,
             incomplete_upload_ttl: Duration::from_secs(86400),
+            validation_max_duration: Duration::from_secs(4 * 3600),
+            ..Default::default()
         };
         let size_tracker = Arc::new(
             crate::cache_size_tracker::CacheSizeTracker::new(

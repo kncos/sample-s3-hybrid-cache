@@ -5,6 +5,11 @@ All notable changes to S3 Hybrid Cache will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-04-26
+
+### Added
+- **Rolling validation scan**: Self-tuning, time-bounded alternative to the daily full validation scan. When a full scan exceeds the configured `validation_max_duration` (default 4 hours), the next cycle automatically switches to rolling mode — scanning a subset of L1 shard directories per cycle and resuming from a persistent cursor on the next invocation. Full coverage is achieved over multiple daily cycles. When rolling mode estimates that a full scan would fit within the budget again, it switches back. Configured via a single knob: `shared_storage.validation_max_duration` (valid range: 10 minutes – 23 hours). Adaptive batch sizing uses the previous cycle's scan rate to estimate how many directories fit within the time budget. Proportional size correction reconciles tracked cache size from partial scan results without large swings. Rolling state (cursor, scan rate, rotation count) is persisted in the existing `validation.json`. Added 6 property-based tests covering mode selection, config validation, directory selection, batch estimation, cursor persistence, and proportional correction. Added 4 integration tests covering end-to-end rolling scan, cursor continuity, backward compatibility, and mode transitions.
+
 ## [1.11.3] - 2026-04-25
 
 ### Changed

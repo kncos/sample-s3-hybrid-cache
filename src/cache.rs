@@ -1036,6 +1036,9 @@ impl CacheManager {
         // Requirement 9.3: Respect validation_enabled configuration
         let mut size_tracker_config = crate::cache_size_tracker::CacheSizeConfig::default();
         size_tracker_config.incomplete_upload_ttl = self.incomplete_upload_ttl;
+        size_tracker_config.validation_max_duration = self.shared_storage.validation_max_duration;
+        size_tracker_config.validation_threshold_warn = self.shared_storage.validation_threshold_warn;
+        size_tracker_config.validation_threshold_error = self.shared_storage.validation_threshold_error;
         // Note: validation_enabled is handled within CacheSizeTracker
         // Note: size_tracking_flush_interval and size_tracking_buffer_size removed -
         // size tracking is now handled by JournalConsolidator
